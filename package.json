@@ -1,0 +1,33 @@
+{
+  "name": "veilcore-api",
+  "version": "1.0.0",
+  "description": "Reference registry for the VeilCore record format: stores holder records sealed, batches their fingerprints and records where each batch root is anchored.",
+  "main": "server.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hunterincoming/veilcore-api.git"
+  },
+  "scripts": {
+    "test": "VEILCORE_OTS=off node --test --test-timeout=180000 test/*.test.mjs",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "VeilCore",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.16.0",
+    "age-encryption": "^0.3.1",
+    "aws4fetch": "^1.0.20",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "veilcore-records": "0.15.0"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "allowScripts": {
+    "better-sqlite3": false
+  }
+}

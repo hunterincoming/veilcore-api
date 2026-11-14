@@ -1,0 +1,16 @@
+{
+  "what": "Compiled Compact contract vendored into this registry (lineage/managed/contract). Only its pure circuits commit, descentEdge and obligationKey are used, by lineage/routes.mjs.",
+  "repo": "https://github.com/hunterincoming/veilcore",
+  "source": "contract/src/lineage.compact",
+  "commit": "53b3c5d9ace205b7669b6e947a6d26f0255bc9bd",
+  "commitDate": "2026-09-30T07:52:04-04:00",
+  "howIdentified": "Not byte-verified: no Compact compiler was available when this was recorded (4 Oct 2026). 53b3c5d is the only commit whose lineage.compact exports encumberOwnRecord, which index.js contains, and the last change to that file before 6f35bee removed it; this file was vendored three minutes later (veilcore-api c6f0e0d). To verify: compile that file at that commit with the compiler below and compare sha256.",
+  "languageVersion": "0.23",
+  "compiler": "not recorded; CI at that commit asked for compact 0.31.0 (see the round D supply-chain review: the installer could fall back to another version silently)",
+  "compactRuntime": "0.16.0",
+  "files": {
+    "contract/index.js": "5d54a7bc6cf58c402e0676e35fc56f7aeafb689a108ee7ce2d901b03960b3791",
+    "contract/index.d.ts": "c9c608c5f7709618b646cd09f7361cc118c4240dcf8b5a23560c03e6d1563702"
+  },
+  "deployedContract": "This build is NOT the deployed contract. Since 6f35bee the lineage circuits live in veilcore.compact, which has no descentEdge, and its commit/obligationKey give different values for the same input. Replace this copy from the exact deployed commit when the registry's lineage layer moves to the consent-based contract, and update this file and test/vendored-contract.test.mjs together."
+}

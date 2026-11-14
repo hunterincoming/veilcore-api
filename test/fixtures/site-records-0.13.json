@@ -1,0 +1,148 @@
+{
+  "note": "Records shaped as bboard-ui (records.ts, commitment.ts) writes them, fingerprinted with veilcore-records 0.13.0 before the registry moved to 0.15.0. Generated once; do not regenerate with a newer SDK. Names, notes and taxa were replaced with invented, neutral ones on 14 Nov 2026 and the fingerprints recomputed with veilcore-records 0.13.0 (same field list).",
+  "sdk": "0.13.0",
+  "records": [
+    {
+      "id": "VEIL-3F2A9C",
+      "nonce": "3f1257252eaf9b4425baa812e12744b4a37dcd1f036303f812a0fc957559974f",
+      "strainName": "Golden Russet x Pippin #4",
+      "bredBy": "Example’s Nursery",
+      "dateCreated": "2026-07-14",
+      "notes": "F2 seedling selection, keeper #4.\nMother tree kept in vitro.",
+      "loggedAt": 1758800000000,
+      "parents": [],
+      "breedingMethod": "Selfed F1, selected from 40 seeds",
+      "refId": "EX-2026-004",
+      "photoFingerprints": [
+        "434d937e11f1af6d5c8f8294f92b97a679b0490638ea51fc89c44f76c5f61013",
+        "5a05e0b297586340036385c3f2296be3d55c3df6ed12b405a37dbef43afab4e8"
+      ],
+      "recordFingerprint": "73da1f66427b9422c069347bd6e73d012fc03ee320ddec16de05ac7d9cd4eaee",
+      "dnaFingerprint": "cb11695c6470e998e024f2ef995de2f582ef78b92f3327497ad44db9ba7bd134",
+      "dnaFileName": "report.pdf",
+      "dnaPairedAt": 1758900000000
+    },
+    {
+      "id": "VEIL-6A9FF1832ED2EA2D6C3454EC689783D0",
+      "nonce": "53c29a43a56083e05a00a41aaaa9cfc72850090011c970007900a326d2b94f86",
+      "strainName": "Scarlet Rambler",
+      "bredBy": "Tester",
+      "dateCreated": "2026-10-02",
+      "notes": "",
+      "loggedAt": 1759480000000,
+      "parents": [
+        {
+          "recordId": "VEIL-3F2A9C",
+          "name": "Golden Russet x Pippin #4"
+        },
+        {
+          "name": "Unknown seedling"
+        }
+      ],
+      "breedingMethod": "Cross",
+      "refId": "",
+      "photoFingerprints": [],
+      "profile": "veilcore/profile/plant-variety/v1",
+      "taxon": "Malus domestica Borkh.",
+      "recordFingerprint": "2763734953c718d109f1f1e9e1ac8e96e9f4e7099d791a6b2baed1f4b6eac09d"
+    },
+    {
+      "id": "VEIL-C548FB4436302A8836484034FD8F469B",
+      "nonce": "b2b523f98b9ec93d7d2d9d3b75d98b6ff23eded42c18f652065a0afbc60b8619",
+      "strainName": "Virus-indexed Clean Line",
+      "bredBy": "Lab",
+      "dateCreated": "2026-10-03",
+      "notes": "meristem",
+      "loggedAt": 1759500000000,
+      "profile": "veilcore/profile/plant-variety/v1",
+      "recordFingerprint": "80d2d09c315a34da7daab0f192816420f4beb507fb66545c7714625d041a1023"
+    },
+    {
+      "id": "VEIL-4C891F0D2DC319E76D176EC9BC366A0F",
+      "nonce": "3946b6237e4f7e760cc9c258b31fd073cc4cc14d21a50129845764ae71054b8d",
+      "strainName": "Café Ørange 🌱",
+      "bredBy": "Beispiel Gärtnerei Übung",
+      "dateCreated": "2026-10-04",
+      "notes": "Notes with \"quotes\", \\ backslash, tab\tand   separator",
+      "loggedAt": 1759560000000,
+      "parents": [],
+      "breedingMethod": "",
+      "refId": "ref/é",
+      "photoFingerprints": [
+        "2933538bedbf52389f8668ac4bdbeaec1305766fef9393e1fe4c5efe29eac4c1"
+      ],
+      "profile": "veilcore/profile/cannabis/v0.1",
+      "taxon": "Rosa gallica L. var. officinalis",
+      "recordFingerprint": "5b851c5b55809dde651ac1de37e35e52290ecd6197639bc411f8c5dd6cb3d09e"
+    },
+    {
+      "id": "VEIL-AE18E902831B3686127A444FE0D3804C",
+      "nonce": "5e7ab668ab270efcca8e2a118c9531ea8648fff3555cf6228c77da557ff5fe5a",
+      "strainName": "Rose Selection 41",
+      "bredBy": "B",
+      "dateCreated": "2026-09-01",
+      "notes": "typo in date",
+      "loggedAt": 1759000000000,
+      "parents": [],
+      "breedingMethod": "m",
+      "refId": "",
+      "recordFingerprint": "6dbb05095526d61162964bd4eef26e112983c2743b20ba2db30adc286b4d7345",
+      "supersededBy": "VEIL-AE18E902831B3686127A444FE0D3804C-C1"
+    },
+    {
+      "id": "VEIL-AE18E902831B3686127A444FE0D3804C-C1",
+      "nonce": "f39939cf050053501623d1abc2d285be1535d774e615c1aa45ee875e9cc61ef8",
+      "strainName": "Rose Selection 41",
+      "bredBy": "B",
+      "dateCreated": "2026-08-01",
+      "notes": "corrected date",
+      "loggedAt": 1759100000000,
+      "parents": [
+        {
+          "recordId": "VEIL-AE18E902831B3686127A444FE0D3804C",
+          "name": "Rose Selection 41"
+        }
+      ],
+      "breedingMethod": "m",
+      "refId": "",
+      "profile": "veilcore/profile/plant-variety/v1",
+      "recordFingerprint": "9a827a1b7ffc9a69e139f1392d2ec1e5a31ac091dd0493ee50c7f08fb7812202",
+      "supersedes": {
+        "recordId": "VEIL-AE18E902831B3686127A444FE0D3804C",
+        "reason": "wrong date",
+        "descentSeverity": "cosmetic",
+        "termsSeverity": "cosmetic",
+        "effectiveAt": "2026-09-02T00:00:00.000Z",
+        "changedFields": [
+          "dateCreated"
+        ]
+      }
+    },
+    {
+      "id": "VEIL-0169295B01CA8D706DBCFE3E4B589529",
+      "nonce": "a9260b499ebd24557e3928b08ad57cb1379cbd470251f56df5b9baf4f20d4ccc",
+      "strainName": "Scarlet Rambler",
+      "bredBy": "Tester",
+      "dateCreated": "2026-10-02",
+      "notes": "",
+      "loggedAt": 1759600000000,
+      "profile": "veilcore/profile/plant-variety/v1",
+      "taxon": "Malus domestica Borkh.",
+      "receivedFrom": "VEIL-3CB1F2500792AAD1C36958A01726418E",
+      "receivedFromCommitment": "cc72e9632c8f6e911482109129cbee2a23c4d578df33100df5bd2c95632ec39a",
+      "receivedAt": 1759590000000,
+      "transferId": "T-d7601c9d5425591e",
+      "quantity": "10 cuttings",
+      "licenseIds": [],
+      "recordFingerprint": "e609c330364a3e60b9c62fe15a104c18981b515a56cadc59cc8ab6c15c908175"
+    },
+    {
+      "id": "VEIL-0001",
+      "strainName": "Very Old Record",
+      "bredBy": "B",
+      "dateCreated": "2025-01-01",
+      "notes": "",
+      "loggedAt": 1736000000000
+    }
+  ]
+}
