@@ -271,53 +271,61 @@ export const createBatches = (db) => {
       if (sealing) return { error: 'a seal is already in progress; try again shortly', code: 409 };
       sealing = true;
       try {
-        let rows, report, batchId, batch;
-        for (let attempt = 1; ; attempt++) {
-          const scan = scanPending();
-          rows = scan.ok;
-          report = scan.skipped.length ? { skipped: scan.skipped } : {};
-          if (rows.length === 0) return { error: 'nothing pending', ...report };
+        const scan = scanPending();
+        let rows = scan.ok;
+        const report = scan.skipped.length ? { skipped: scan.skipped } : {};
+        if (rows.length === 0) return { error: 'nothing pending', ...report };
 
-          // An id not already used. It is the day and four random hex digits, so two batches on
-          // one day had a 1 in 65,536 chance of the same id, and the insert below then failed
-          // as if another seal had got there first (found 15 Oct 2026, the likely cause of a
-          // seal in the test suite failing once). Checked here, under the one-seal-at-a-time
-          // flag; a second process on the same database is still caught by the plain INSERT.
-          const usedId = st('SELECT 1 FROM batches WHERE batch_id = ?');
-          batchId = newBatchId();
-          for (let tries = 1; usedId.get(batchId) && tries < 100; tries++) batchId = newBatchId();
-          if (usedId.get(batchId)) return { error: 'no unused batch id is left for today; seal again tomorrow', code: 503 };
+        // An id not already used. It is the day and four random hex digits, so two batches on
+        // one day had a 1 in 65,536 chance of the same id, and the insert below then failed
+        // as if another seal had got there first (found 15 Oct 2026, the likely cause of a
+        // seal in the test suite failing once). Checked here, under the one-seal-at-a-time
+        // flag; a second process on the same database is still caught by the plain INSERT.
+        const usedId = st('SELECT 1 FROM batches WHERE batch_id = ?');
+        let batchId = newBatchId();
+        for (let tries = 1; usedId.get(batchId) && tries < 100; tries++) batchId = newBatchId();
+        if (usedId.get(batchId)) return { error: 'no unused batch id is left for today; seal again tomorrow', code: 503 };
+
+        const insertBatch = st(
+          'INSERT INTO batches (batch_id, root, sealed_at, record_count, anchor, ots_status) VALUES (?,?,?,?,NULL,?)');
+        // Plain INSERT: a commitment already in a batch is a conflict that aborts the whole
+        // seal, never a silent overwrite of a proof someone may already hold. That also
+        // covers a second registry process sharing this database, which the flag cannot.
+        const insertProof = st('INSERT INTO batch_proofs (commitment, batch_id, proof) VALUES (?,?,?)');
+        // A record deleted (or changed) while the batch was built is not dated: checked again
+        // inside the write. Those rows are left out and the tree built again from the rest, so
+        // the set only shrinks and steady deletes can't keep a seal from finishing.
+        const stillThere = st(`SELECT 1 FROM records WHERE id = ? AND json_extract(body, '$.recordFingerprint') = ?`);
+        let batch;
+        let leftOut = 0;
+        for (;;) {
           batch = await buildBatch(rows.map((r) => r.commitment), batchId);
-
-          const insertBatch = st(
-            'INSERT INTO batches (batch_id, root, sealed_at, record_count, anchor, ots_status) VALUES (?,?,?,?,NULL,?)');
-          // Plain INSERT: a commitment already in a batch is a conflict that aborts the whole
-          // seal, never a silent overwrite of a proof someone may already hold. That also
-          // covers a second registry process sharing this database, which the flag cannot.
-          const insertProof = st('INSERT INTO batch_proofs (commitment, batch_id, proof) VALUES (?,?,?)');
-          // A record deleted (or changed) while the batch was built is not dated: checked again
-          // inside the write, so nothing deleted after the read gets a proof.
-          const stillThere = st(`SELECT 1 FROM records WHERE id = ? AND json_extract(body, '$.recordFingerprint') = ?`);
+          let gone = [];
           try {
             db.transaction(() => {
-              for (const r of rows) {
-                if (r.id !== 'deal-message' && !stillThere.get(r.id, r.commitment)) throw PENDING_CHANGED;
-              }
+              gone = rows.filter((r) => r.id !== 'deal-message' && !stillThere.get(r.id, r.commitment));
+              if (gone.length) throw PENDING_CHANGED;
               insertBatch.run(batchId, batch.root, Date.now(), rows.length, otsEnabled() ? 'requested' : null);
               for (const [commitment, proof] of Object.entries(batch.proofs)) {
                 insertProof.run(commitment, batchId, JSON.stringify(proof));
               }
             })();
           } catch (e) {
-            // A record deleted mid-build: read the pending set again, a few times at most.
-            if (e === PENDING_CHANGED && attempt < 3) continue;
-            if (e === PENDING_CHANGED || String(e?.code ?? '').startsWith('SQLITE_CONSTRAINT')) {
+            if (e === PENDING_CHANGED) {
+              const out = new Set(gone);
+              rows = rows.filter((r) => !out.has(r));
+              leftOut += gone.length;
+              if (rows.length === 0) return { error: 'nothing pending', ...report };
+              continue;
+            }
+            if (String(e?.code ?? '').startsWith('SQLITE_CONSTRAINT')) {
               return { error: 'the pending set changed while sealing (another seal got there first); nothing was written, seal again', code: 409 };
             }
             throw e;
           }
           break;
         }
+        if (leftOut) report.leftOutWhileSealing = leftOut;
 
         // A second, independent date on Bitcoin. In the background: a slow calendar must not
         // hold up sealing. A failure is recorded on the batch and retried by the timer.

@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const DELETED_CODE = 'deleted';
+/** A save whose correction link names a deleted id: the row itself is live, only its link is refused. */
+const LINKS_DELETED_CODE = 'links-deleted';
 const DELETED_REASON = 'this record was deleted by its holder; it can’t be saved again';
 
 const setupTombstones = (db) => {
@@ -35,9 +37,10 @@ const setupTombstones = (db) => {
     linkRefusal: (id, field) => ({
       id: String(id).slice(0, 128),
       reason: `${field} names a record that was deleted by its holder; nothing was changed`,
-      code: DELETED_CODE,
+      code: LINKS_DELETED_CODE,
+      field,
     }),
   };
 };
 
-module.exports = { setupTombstones, DELETED_CODE, DELETED_REASON };
+module.exports = { setupTombstones, DELETED_CODE, LINKS_DELETED_CODE, DELETED_REASON };

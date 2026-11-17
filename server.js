@@ -148,6 +148,10 @@ setupFingerprintHolders(db, asStoredKey);
 const firstHolderOf = db.prepare('SELECT holder_key, first_at FROM fingerprint_holders WHERE fingerprint = ?');
 // Ids a holder deleted stay deleted (tombstones.js): no save, dating row or restore brings one back.
 const { setupTombstones } = require('./tombstones.js');
+// How close an anchor and a deletion can be before /verify says their order is unknown: the
+// anchor skew allowed in lineage/batches.mjs (ANCHOR_CLOCK_SKEW_MS) plus the minute deletedAt
+// is rounded to.
+const DELETION_ORDER_WINDOW_MS = 5 * 60_000 + 60_000;
 const tombstones = setupTombstones(db);
 /**
  * The same conversion, on a timer, without the file rebuild (round 2). Rows written in
@@ -1669,22 +1673,46 @@ app.delete('/api/records', (req, res) => {
   const bodyOf = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
   const delGrant = db.prepare('DELETE FROM disclosure_grants WHERE record_id = ? AND holder_key = ?');
   const delNotices = db.prepare('DELETE FROM license_notices WHERE record_id = ? AND holder_key = ?');
+  // A record with a live correction would leave that correction naming a deleted record: refused,
+  // as the site does. (Licence lines are the holder's own notices and go with the record; the
+  // licensee's answers stay theirs. Licences themselves are sealed, so only the site can see them.)
+  const correctionsOf = db.prepare(
+    "SELECT id FROM records WHERE holder_key = ? AND json_extract(body, '$.supersedes.recordId') = ?",
+  );
+  // Deleting a correction takes the corrected record's link to it too, so nothing points at a
+  // tombstone (the site's "take back a correction" deletes the correction).
+  const clearLinkTo = db.prepare(
+    `UPDATE records SET body = json_remove(body, '$.supersededBy'), updated_at = ?
+     WHERE id = ? AND holder_key = ? AND json_extract(body, '$.supersededBy') = ?`,
+  );
   const removed = [];
   const notYours = [];
+  const refused = [];
   const tx = db.transaction((list) => {
     const t = now();
+    const asked = new Set(list);
     for (const id of list) {
       const row = bodyOf.get(id, holder);
+      if (row) {
+        if (correctionsOf.all(holder, id).some((c) => !asked.has(c.id))) {
+          refused.push({ id, code: 'linked', reason: 'a correction of this record still exists; delete the correction first' });
+          continue;
+        }
+      }
       const info = row ? del.run(id, holder) : { changes: 0 };
       if (info.changes > 0) {
         removed.push(id);
         let fp = null;
+        let corrects = null;
         try {
-          fp = JSON.parse(row.body).recordFingerprint ?? null;
+          const b = JSON.parse(row.body);
+          fp = b.recordFingerprint ?? null;
+          corrects = typeof b.supersedes?.recordId === 'string' ? b.supersedes.recordId : null;
         } catch {
           // A malformed body still gets its tombstone, just without a proof code.
         }
         tombstones.mark(id, holder, fp, t);
+        if (corrects) clearLinkTo.run(t, corrects, holder, id);
         delGrant.run(id, holder);
         delNotices.run(id, holder);
       } else notYours.push(id);
@@ -1696,9 +1724,10 @@ app.delete('/api/records', (req, res) => {
   // another holder changes nothing, and saying so beats a count that looks like
   // success.
   res.json({
-    ok: notYours.length === 0,
+    ok: notYours.length === 0 && refused.length === 0,
     removed,
     ...(notYours.length ? { notRemoved: notYours, reason: 'no such record under this holder key' } : {}),
+    ...(refused.length ? { refused } : {}),
   });
 });
 
@@ -2504,10 +2533,15 @@ app.get('/verify/:id', (req, res) => {
     // anchor is on the ledger whatever happens here. 404, so older check pages read "not found".
     const gone = tombstones.of(req.params.id);
     if (!gone) return res.status(404).json({ found: false });
-    const proof = batches && gone.fingerprint ? batches.proofFor(gone.fingerprint) : null;
+    const evidence = batches && gone.fingerprint ? batches.evidenceFor(gone.fingerprint) : null;
+    const proof = evidence?.proof ?? null;
     // The proof code is public (it is what a check link carries), so a page can tie its link
     // to this record before it reports any date. The time is to the minute: enough to read.
     const anchoredAt = proof?.anchor ? Date.parse(proof.anchor.anchoredAt) : NaN;
+    // anchoredAt is the operator's report and may be off by the anchor skew, and deletedAt is
+    // given to the minute: inside that window, before or after can't be told.
+    const window = DELETION_ORDER_WINDOW_MS;
+    const sealedAt = evidence?.batch ? Date.parse(evidence.batch.sealedAt) : NaN;
     return res.status(404).json({
       found: false,
       deleted: true,
@@ -2520,12 +2554,18 @@ app.get('/verify/:id', (req, res) => {
             anchor: proof.anchor,
             anchorCheckedOnChain: false,
             // A batch sealed before the deletion can be anchored after it.
-            anchoredRelativeToDeletion: Number.isFinite(anchoredAt)
-              ? anchoredAt < gone.deleted_at
+            anchoredRelativeToDeletion: !Number.isFinite(anchoredAt)
+              ? 'unknown'
+              : anchoredAt < gone.deleted_at - window
                 ? 'before'
-                : 'after'
-              : 'unknown',
+                : anchoredAt > gone.deleted_at + window
+                  ? 'after'
+                  : 'unknown',
           }
+        : {}),
+      // Both times are this registry's own clock, so the order of sealing and deletion is exact.
+      ...(Number.isFinite(sealedAt)
+        ? { sealedRelativeToDeletion: sealedAt < gone.deleted_at ? 'before' : 'after' }
         : {}),
     });
   }

@@ -113,6 +113,8 @@ test('a record deleted after its batch was anchored: the check link still names 
   const anchored = await call('POST', `/batches/${batchId}/anchor`, undefined, { network: 'mainnet', contractAddress: CONTRACT, txHash: tx, blockHeight: 7, anchoredAt }, operator);
   assert.equal(anchored.status, 200, JSON.stringify(anchored.json));
   await remove(holder, [id]);
+  // Deleted well after the anchor, beyond the anchor skew and the minute rounding.
+  db.prepare('UPDATE record_tombstones SET deleted_at = deleted_at + 600000 WHERE id = ?').run(id);
   const v = await call('GET', `/verify/${id}`);
   assert.equal(v.json.deleted, true);
   assert.equal(v.json.anchored, true);
@@ -136,7 +138,15 @@ test('a batch sealed before the deletion but anchored after it says so', async (
   assert.equal(anchored.status, 200, JSON.stringify(anchored.json));
   const v = await call('GET', `/verify/${id}`);
   assert.equal(v.json.anchored, true);
-  assert.equal(v.json.anchoredRelativeToDeletion, 'after');
+  // Two seconds apart is inside the anchor skew: the order of anchor and deletion can't be told,
+  // but the batch was sealed before the deletion (both the registry's own clock).
+  assert.equal(v.json.anchoredRelativeToDeletion, 'unknown');
+  assert.equal(v.json.sealedRelativeToDeletion, 'before');
+  // Deleted well before the anchor: after.
+  db.prepare('UPDATE record_tombstones SET deleted_at = deleted_at - 600000 WHERE id = ?').run(id);
+  const later = await call('GET', `/verify/${id}`);
+  assert.equal(later.json.anchoredRelativeToDeletion, 'after');
+  assert.equal(later.json.sealedRelativeToDeletion, 'after');
 });
 
 test('a record deleted while a batch is being built is left out of it', async () => {
@@ -155,6 +165,7 @@ test('a record deleted while a batch is being built is left out of it', async ()
   mem.prepare('DELETE FROM records WHERE id = ?').run(drop.id);
   const out = await sealing;
   assert.equal(out.recordCount, 1, JSON.stringify(out));
+  assert.equal(out.leftOutWhileSealing, 1);
   assert.ok(b.proofFor(keep.fp));
   assert.equal(b.proofFor(drop.fp), null);
 });
@@ -167,8 +178,68 @@ test('a correction link can’t name a deleted record', async () => {
   await remove(holder, [id]);
   const fix = sealForTest({ id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'Fix', supersedes: { recordId: id, fields: ['strainName'], at: new Date().toISOString() } }, randomBytes(32));
   const r = await call('PUT', '/api/records', stranger, [fix]);
-  assert.equal(r.json.rejected?.[0]?.code, 'deleted', JSON.stringify(r.json));
+  // Its own code: the row is live, only its link is refused, so a browser keeps it.
+  assert.equal(r.json.rejected?.[0]?.code, 'links-deleted', JSON.stringify(r.json));
+  assert.equal(r.json.rejected?.[0]?.field, 'supersedes');
 });
+
+test('steady deletes during building never stop a seal: each round leaves the gone rows out', async () => {
+  const { createBatches } = await import('../lineage/batches.mjs');
+  const Database = require('better-sqlite3');
+  const mem = new Database(':memory:');
+  mem.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT, body TEXT)');
+  const rows = Array.from({ length: 6 }, () => ({ id: recordId(), fp: hex() }));
+  for (const r of rows) {
+    mem.prepare('INSERT INTO records (id, holder_key, body) VALUES (?, ?, ?)').run(r.id, 'h', JSON.stringify({ recordFingerprint: r.fp }));
+  }
+  const b = createBatches(mem);
+  const sealing = b.seal();
+  // One delete lands during each of the first several builds.
+  let n = 0;
+  const timer = setInterval(() => {
+    if (n < 4) mem.prepare('DELETE FROM records WHERE id = ?').run(rows[n++].id);
+  }, 0);
+  const out = await sealing;
+  clearInterval(timer);
+  assert.ok(out.recordCount >= 2 && out.recordCount <= 6, JSON.stringify(out));
+  for (const r of rows) {
+    const there = mem.prepare('SELECT 1 FROM records WHERE id = ?').get(r.id);
+    if (!there) assert.equal(b.proofFor(r.fp), null, 'a deleted row is never dated');
+  }
+});
+
+test('deleting a corrected record with a live correction is refused; deleting the correction clears the link', async () => {
+  const holder = hex();
+  const key = randomBytes(32);
+  const orig = { id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'Orig' };
+  const fixId = recordId();
+  const fix = { id: fixId, recordFingerprint: hex(), nonce: hex(), strainName: 'Fixed', supersedes: { recordId: orig.id, fields: ['strainName'], at: new Date().toISOString() } };
+  const saved = await call('PUT', '/api/records', holder, [sealForTest({ ...orig, supersededBy: fixId }, key), sealForTest(fix, key)]);
+  assert.equal(saved.json.ok, true, JSON.stringify(saved.json));
+
+  const refused = await remove(holder, [orig.id]);
+  assert.equal(refused.json.ok, false);
+  assert.deepEqual(refused.json.removed, []);
+  assert.equal(refused.json.refused?.[0]?.code, 'linked');
+
+  // The correction goes, and the record's link to it with it (no link to a tombstone).
+  assert.deepEqual((await remove(holder, [fixId])).json.removed, [fixId]);
+  assert.equal((await call('GET', `/verify/${orig.id}`)).json.supersededBy, undefined);
+
+  // A stale tab still carrying the link: refused as links-deleted (the row is live), not deleted.
+  const stale = await call('PUT', '/api/records', holder, [sealForTest({ ...orig, supersededBy: fixId }, key)]);
+  assert.equal(stale.json.rejected?.[0]?.code, 'links-deleted', JSON.stringify(stale.json));
+  assert.equal(stale.json.rejected?.[0]?.field, 'supersededBy');
+
+  // Both together are fine.
+  const holder2 = hex();
+  const key2 = randomBytes(32);
+  const o2 = { id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'O' };
+  const f2 = { id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'F', supersedes: { recordId: o2.id, fields: ['strainName'], at: new Date().toISOString() } };
+  await call('PUT', '/api/records', holder2, [sealForTest({ ...o2, supersededBy: f2.id }, key2), sealForTest(f2, key2)]);
+  assert.deepEqual((await remove(holder2, [o2.id, f2.id])).json.removed.sort(), [o2.id, f2.id].sort());
+});
+
 
 test('an id never stored still answers plain not found, and deleting someone else’s record leaves no tombstone', async () => {
   const id = recordId();
