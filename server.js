@@ -146,6 +146,9 @@ migrateHolderKeys(db);
 // fingerprint-holders.js. Made, and backfilled once, before anything is stored.
 setupFingerprintHolders(db, asStoredKey);
 const firstHolderOf = db.prepare('SELECT holder_key, first_at FROM fingerprint_holders WHERE fingerprint = ?');
+// Ids a holder deleted stay deleted (tombstones.js): no save, dating row or restore brings one back.
+const { setupTombstones } = require('./tombstones.js');
+const tombstones = setupTombstones(db);
 /**
  * The same conversion, on a timer, without the file rebuild (round 2). Rows written in
  * plain text by older code after this one started (a deploy overlap, a rollback) are also
@@ -726,6 +729,9 @@ const featuresServed = () => [
   // key), from the day after that date; POST /license-answers/lookup (review round 3, B2, L1). A
   // site that publishes notices needs this: the unsigned v2 shape is refused.
   'license-notices-v3',
+  // A deleted record stays deleted (tombstones.js): saves and dating rows of its id are refused
+  // with code "deleted", and /verify/:id answers `deleted: true`. The site's delete needs it.
+  'record-tombstones-v1',
   // POST/GET /license-invites (lineage/license-invites.mjs): the mailbox a real two-party
   // license needs between issuer and licensee. A site that makes real licenses needs it.
   ...(licenseInvites ? ['license-invites-v1'] : []),
@@ -1241,6 +1247,7 @@ app.put('/api/records', (req, res) => {
     if (!item || typeof item.id !== 'string' || !item.id) continue;
     const problem = recordRowProblem(item);
     if (problem) rejected.push({ id: item.id.slice(0, 128), reason: problem });
+    else if (tombstones.isDeleted(item.id)) rejected.push(tombstones.refusal(item.id));
     else shaped.push(item);
   }
 
@@ -1579,6 +1586,10 @@ app.put('/api/records/dating', (req, res) => {
       }
       if (seen.has(item.id)) continue;
       seen.add(item.id);
+      if (tombstones.isDeleted(item.id)) {
+        rejected.push(tombstones.refusal(item.id));
+        continue;
+      }
       const owner = holderOfId.get(item.id);
       if (owner && owner.holder_key !== holder) {
         notWritten.push(item.id);
@@ -1635,15 +1646,25 @@ app.delete('/api/records', (req, res) => {
   if (!ids || ids.length === 0) return res.status(400).json({ error: 'expected { ids: [...] }' });
 
   const del = db.prepare('DELETE FROM records WHERE id = ? AND holder_key = ?');
+  const bodyOf = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
   const delGrant = db.prepare('DELETE FROM disclosure_grants WHERE record_id = ? AND holder_key = ?');
   const delNotices = db.prepare('DELETE FROM license_notices WHERE record_id = ? AND holder_key = ?');
   const removed = [];
   const notYours = [];
   const tx = db.transaction((list) => {
+    const t = now();
     for (const id of list) {
-      const info = del.run(id, holder);
+      const row = bodyOf.get(id, holder);
+      const info = row ? del.run(id, holder) : { changes: 0 };
       if (info.changes > 0) {
         removed.push(id);
+        let fp = null;
+        try {
+          fp = JSON.parse(row.body).recordFingerprint ?? null;
+        } catch {
+          // A malformed body still gets its tombstone, just without a proof code.
+        }
+        tombstones.mark(id, holder, fp, t);
         delGrant.run(id, holder);
         delNotices.run(id, holder);
       } else notYours.push(id);
@@ -2458,7 +2479,21 @@ app.get('/verify/:id', (req, res) => {
   // holder can change or take it back at any time: no cache keeps an older one (12 Nov 2026).
   res.set('Cache-Control', 'no-store');
   const row = db.prepare('SELECT body, holder_key, first_seen FROM records WHERE id = ?').get(req.params.id);
-  if (!row) return res.status(404).json({ found: false });
+  if (!row) {
+    // A deleted record says so, and still says whether it was dated before the deletion: the
+    // anchor is on the ledger whatever happens here. 404, so older check pages read "not found".
+    const gone = tombstones.of(req.params.id);
+    if (!gone) return res.status(404).json({ found: false });
+    const proof = batches && gone.fingerprint ? batches.proofFor(gone.fingerprint) : null;
+    return res.status(404).json({
+      found: false,
+      deleted: true,
+      deletedBy: 'record-holder',
+      deletedAt: new Date(gone.deleted_at).toISOString(),
+      anchored: Boolean(proof && proof.anchor),
+      ...(proof && proof.anchor ? { anchor: proof.anchor, anchorCheckedOnChain: false } : {}),
+    });
+  }
   const r = JSON.parse(row.body);
   const grant = grantFor(row, req.params.id);
   const { on, notGranted, refused } = effectiveDisclosure(grant.show, req.query.show);

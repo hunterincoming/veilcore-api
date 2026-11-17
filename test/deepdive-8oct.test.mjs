@@ -287,6 +287,9 @@ test('LOW: a claimed transfer is consent only for the material it carried, from 
   // The sender deletes the source; someone else stores their own record under that id.
   assert.deepEqual((await call('DELETE', '/api/records', { holder: sender, body: { ids: [src.id] } })).json.removed, [src.id]);
   const squat = await makeRecord(src.id, { strainName: 'Victim Mother' });
+  // A deleted id can't be stored again (tombstones.js); the rule below still holds for rows from before that.
+  assert.equal((await call('PUT', '/api/records', { holder: victim, body: [squat] })).json.rejected[0].code, 'deleted');
+  db.prepare('DELETE FROM record_tombstones WHERE id = ?').run(src.id);
   assert.equal((await call('PUT', '/api/records', { holder: victim, body: [squat] })).json.count, 1);
 
   // The recipient names the victim's record as the parent: a proposal, not an edge.

@@ -11,7 +11,7 @@ import { untilReady, testBody } from './helpers.mjs';
 process.env.DB_PATH = ':memory:';
 process.env.VEILCORE_OPERATOR_TOKEN = 'test-operator-token-at-least-32-chars';
 const require = createRequire(import.meta.url);
-const { app } = require('../server.js');
+const { app, db } = require('../server.js');
 
 let base;
 let server;
@@ -100,6 +100,9 @@ test('R4 a claim only inherits the sender\'s own record, not one re-stored under
   const offer = await call('POST', '/transfers', { holder: sender, body: { sourceRecord: rec.id, toHandle: 'r@x' } });
   await call('DELETE', '/api/records', { holder: sender, body: { ids: [rec.id] } });
   const fake = await makeRecord('VEIL-SRC-DEL', { strainName: 'Attacker content' });
+  // A deleted id can't be stored again (tombstones.js); the rule below still holds for rows from before that.
+  assert.equal((await call('PUT', '/api/records', { holder: attacker, body: [fake] })).json.rejected[0].code, 'deleted');
+  db.prepare('DELETE FROM record_tombstones WHERE id = ?').run('VEIL-SRC-DEL');
   assert.equal((await call('PUT', '/api/records', { holder: attacker, body: [fake] })).json.count, 1);
   const claim = await call('POST', `/transfers/${offer.json.transferId}/claim`, {
     holder: recipient, body: { claimCode: offer.json.claimCode },

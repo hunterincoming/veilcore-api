@@ -638,6 +638,19 @@ the record), so it tells this registry nothing about what was typed.
 Answer: `{ ok, dated: [ids], rejected?: [{ id, reason }], notWritten?, reason? }`.
 `/health` lists `dating-first-v1`, and the site's deploys require it.
 
+### Deleting: `DELETE /api/records` (17 Nov 2026)
+
+Body `{ "ids": [...] }`, the holder's own ids. Answers `{ ok, removed, notRemoved?, reason? }`:
+`removed` lists what was actually deleted, so an empty list is a failure.
+
+A deleted id stays deleted (`tombstones.js`, table `record_tombstones`). A later save or dating
+row of that id is refused per row with `code: "deleted"`, from any holder: a save already on
+its way, another tab or a restored backup can't bring it back, and nobody can reuse the id. A
+proof code not yet in a batch is never batched. `GET /verify/:id` answers 404 with
+`{ found: false, deleted: true, deletedBy: "record-holder", deletedAt, anchored, anchor? }`:
+an anchor made before the deletion is on the ledger and is still named. `/health` lists
+`record-tombstones-v1`.
+
 ### Obligations (round 3, P5)
 
 `POST /lineage/obligations` `{ record, obligation, beneficiary? }` (holder key) attaches an

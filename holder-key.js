@@ -68,6 +68,8 @@ const HOLDER_KEY_COLUMNS = [
   // The first holder of each fingerprint (fingerprint-holders.js, 9 Nov 2026): a key moved to
   // its stored form keeps the fingerprints it held first.
   ['fingerprint_holders', 'holder_key'],
+  // Records a holder deleted (tombstones.js).
+  ['record_tombstones', 'holder_key'],
 ];
 
 /** Columns among HOLDER_KEY_COLUMNS that exist in this database. */
