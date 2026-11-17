@@ -541,6 +541,11 @@ const capRefusal = (cap) =>
   cap < MAX_PER_HOLDER
     ? { error: `the free plan keeps ${cap} records here; a paid plan keeps more`, code: 'plan-limit', cap }
     : { error: `a holder may keep at most ${MAX_PER_HOLDER} records here` };
+/** The same, as one row's entry in `rejected`: a save refuses only its new rows past a ceiling. */
+const capRowRefusal = (id, cap) => {
+  const r = capRefusal(cap);
+  return { id, reason: r.error, ...(r.code ? { code: r.code, cap } : {}) };
+};
 /**
  * Most bytes one holder may keep, in records and (separately) in licences. The count alone
  * allowed 10,000 × 64 KB, about 640 MB under one key anyone can make, and every read of the
@@ -581,7 +586,7 @@ const storedKeyOf = (req) => {
 
 // Paid plans (billing.js): open a checkout on Paddle's own page, and read the holder's plan.
 const recordsHeldBy = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?');
-app.post('/api/billing/checkout', (req, res) => billing.checkout(storedKeyOf(req), req.body, res));
+app.post('/api/billing/checkout', (req, res) => billing.checkout(storedKeyOf(req), req.body, res, req.ip));
 app.get('/api/billing/plan', (req, res) => {
   const holder = storedKeyOf(req);
   return billing.planOf(holder, holder ? recordsHeldBy.get(holder).n : 0, res);
@@ -1216,15 +1221,7 @@ app.put('/api/records', (req, res) => {
   // A record's name is sealed (round 5, CONTRACT.md #28): a save that sends it in the clear is
   // refused whole, before anything is stored, so a site that still sends it learns at once.
   if (req.body.some(hasClearName)) return res.status(400).json({ error: NAME_IN_CLEAR });
-  // Count only ids this holder does not already have: the app re-sends records it has
-  // already stored, and counting those twice refused saves far below the cap.
-  const held = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?').get(holder).n;
   const isMine = db.prepare('SELECT 1 FROM records WHERE id = ? AND holder_key = ?');
-  const fresh = new Set(
-    req.body.filter((r) => r && typeof r.id === 'string' && !isMine.get(r.id, holder)).map((r) => r.id),
-  ).size;
-  const passed = billing.ceilingPassed(holder, held, fresh);
-  if (passed) return res.status(413).json(capRefusal(passed));
 
   // first_seen is when the registry first saw THIS content. Keeping it across an update
   // that changed the commitment let a holder store a placeholder, swap in different
@@ -1315,9 +1312,9 @@ app.put('/api/records', (req, res) => {
   const heldBytes = db.prepare('SELECT COALESCE(SUM(octet_length(body)), 0) AS n FROM records WHERE holder_key = ?');
   let written = 0;
   let projectedBytes = 0;
-  let passedInTx = 0;
+  const capRefused = new Set(); // new ids refused for a ceiling: not stored, so nothing may name them
+  const freeCorrections = new Set(); // ids that are a record's one correction: not counted on a plan
   const tx = db.transaction((items) => {
-    const heldAtStart = heldNow.get(holder).n;
     let kid = vaultKidOf(holder);
     // One entry per id, the last copy sent (round 2): the same id several times in one
     // save was each counted against the stored row, so small copies followed by a big one
@@ -1416,9 +1413,45 @@ app.put('/api/records', (req, res) => {
       plan.delete(item.id);
       plan.set(item.id, { item, body: JSON.stringify(toStore), prior, rev });
     }
-    const freshNow = [...plan.keys()].filter((id) => !isMine.get(id, holder)).length;
-    passedInTx = billing.ceilingPassed(holder, heldNow.get(holder).n, freshNow);
-    if (passedInTx) return 'count';
+    // The ceilings, row by row: only new rows past one are refused, and the rest of the save is
+    // stored, so a holder at their plan's ceiling can always save edits even while a new record
+    // waits in their browser. An id held by another holder isn't new here (it isn't written).
+    // A record's one correction doesn't count on a plan: the registry takes one correction per
+    // record (corrections.js), and a correction of a correction counts, so no chain of them
+    // dates new proof codes for free.
+    const bodyTarget = (body) => {
+      const t = JSON.parse(body).supersedes?.recordId;
+      return typeof t === 'string' ? t : undefined;
+    };
+    const isPlainRecord = (id) => {
+      const held = storedBody.get(id, holder);
+      if (held) return JSON.parse(held.body).supersedes === undefined;
+      const inSave = plan.get(id);
+      return !!inSave && bodyTarget(inSave.body) === undefined;
+    };
+    const freeTargets = new Map(); // free correction id -> the record it corrects
+    for (const [id, r] of plan) {
+      const t = bodyTarget(r.body);
+      if (t !== undefined && t !== id && isPlainRecord(t) && billing.correctionIsFree(holder, t)) {
+        freeCorrections.add(id);
+        freeTargets.set(id, t);
+      }
+    }
+    let hardRoom = MAX_PER_HOLDER - heldNow.get(holder).n;
+    const room = billing.planRoom(holder);
+    for (const [id] of [...plan]) {
+      if (isMine.get(id, holder) || holderOfId.get(id)) continue;
+      const counts = !freeCorrections.has(id) && !billing.wasCounted(holder, id);
+      const cap = hardRoom <= 0 ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
+      if (cap) {
+        plan.delete(id);
+        rejected.push(capRowRefusal(id, cap));
+        capRefused.add(id);
+        continue;
+      }
+      hardRoom--;
+      if (counts) room.room--;
+    }
     const before = heldBytes.get(holder).n;
     let after = before;
     for (const [id, { body, prior }] of plan) {
@@ -1461,7 +1494,7 @@ app.put('/api/records', (req, res) => {
       // Refused in this save: shape and plan refusals (a relinked record's content is refused,
       // but it is linked to its correction, so its correction is not refused for it).
       const refused = new Set(rejected.map((x) => x.id).filter((id) => !relinkedIds.has(id)));
-      const notStored = new Set(); // ids in this save this registry will not hold
+      const notStored = new Set(capRefused); // ids in this save this registry will not hold
       const decided = new Set();
       const decide = (r, out) => {
         const id = r.item.id;
@@ -1495,12 +1528,21 @@ app.put('/api/records', (req, res) => {
         }
       }
       const fresh = new Map();
+      const inserted = []; // ids this save added for this holder
       for (const r of [...rows.filter((x) => targetOf(x) !== undefined), ...rows.filter((x) => targetOf(x) === undefined)]) {
         if (decided.has(r.item.id)) continue;
         try {
           const info = writeRow(r.item.id, r.body, now());
           if (info.changes === 0) fresh.set(r.item.id, { kind: 'notWritten' });
-          else written++;
+          else {
+            written++;
+            if (!r.prior) inserted.push(r.item.id);
+            // Dated first as a bare proof code (counted then), now stored as a free correction.
+            else if (freeCorrections.has(r.item.id) && isDatingOnlyBody(JSON.parse(r.prior.body))) {
+              billing.uncount(holder, r.item.id);
+              billing.noteFreeCorrection(holder, freeTargets.get(r.item.id));
+            }
+          }
         } catch (e) {
           if (!isSecondCorrection(e)) throw e;
           const recordId = targetOf(r);
@@ -1517,7 +1559,8 @@ app.put('/api/records', (req, res) => {
         throw REDO;
       }
       for (const { id, supersededBy } of relinks) relink.run(supersededBy, now(), id, holder);
-      billing.noteAdded(holder, heldNow.get(holder).n - heldAtStart);
+      billing.noteAdded(holder, inserted.filter((id) => !freeCorrections.has(id)));
+      for (const id of inserted) if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id));
     });
     for (;;) {
       try {
@@ -1530,7 +1573,6 @@ app.put('/api/records', (req, res) => {
     return 'ok';
   });
   const outcome = tx(shaped);
-  if (outcome === 'count') return res.status(413).json(capRefusal(passedInTx));
   if (outcome === 'bytes') {
     return res.status(413).json({
       error: `a holder may keep at most ${megabytes(HOLDER_MAX_BYTES)} of records here; this save would make it ${megabytes(projectedBytes)}. Nothing was changed.`,
@@ -1602,6 +1644,7 @@ app.put('/api/records/dating', (req, res) => {
   const heldNow = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?');
   const tx = db.transaction((items) => {
     let held = heldNow.get(holder).n;
+    const room = billing.planRoom(holder);
     const seen = new Set();
     for (const item of items) {
       const problem = datingRowProblem(item);
@@ -1626,10 +1669,11 @@ app.put('/api/records/dating', (req, res) => {
         rejected.push({ id: item.id, reason: 'this fingerprint is already registered by another holder' });
         continue;
       }
-      const passed = billing.ceilingPassed(holder, held, 1);
-      if (passed) {
-        const r = capRefusal(passed);
-        rejected.push({ id: item.id, reason: r.error, ...(r.code ? { code: r.code } : {}) });
+      // An id that counted before (added, then deleted) doesn't count again.
+      const counts = !billing.wasCounted(holder, item.id);
+      const cap = held + 1 > MAX_PER_HOLDER ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
+      if (cap) {
+        rejected.push(capRowRefusal(item.id, cap));
         continue;
       }
       const t = now();
@@ -1637,7 +1681,8 @@ app.put('/api/records/dating', (req, res) => {
       if (info.changes === 0) notWritten.push(item.id);
       else {
         held++;
-        billing.noteAdded(holder, 1);
+        if (counts) room.room--;
+        billing.noteAdded(holder, [item.id]);
         dated.push(item.id);
       }
     }

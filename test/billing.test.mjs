@@ -147,9 +147,10 @@ test('free: three records, then the save and the dating route both refuse, sayin
   assert.equal((await date(holder, 2)).status, 200);
   assert.equal((await save(holder)).json.ok, true);
   const over = await save(holder);
-  assert.equal(over.status, 413);
-  assert.equal(over.json.code, 'plan-limit');
-  assert.equal(over.json.cap, 3);
+  assert.equal(over.status, 200);
+  assert.equal(over.json.ok, false);
+  assert.equal(over.json.rejected?.[0]?.code, 'plan-limit', JSON.stringify(over.json));
+  assert.equal(over.json.rejected?.[0]?.cap, 3);
   const dated = await date(holder, 1);
   assert.equal(dated.json.rejected?.[0]?.code, 'plan-limit', JSON.stringify(dated.json));
   const p = await plan(holder);
@@ -290,9 +291,17 @@ test('switched on over existing holders: those above the free number keep theirs
   assert.equal(b.recordCapFor('h1:big'), 8);
   assert.equal(b.recordCapFor('h1:small'), 3);
   assert.equal(b.recordCapFor('h1:new'), 3);
-  // Done once: a holder who grows later is not grandfathered at the next start.
+  // Done when billing goes on: a holder who grows while it stays on is not grandfathered again.
   for (let i = 0; i < 5; i++) add.run(`small-later-${i}`, 'h1:small', '{}');
   assert.equal(createBilling(db, { env, hardCap: 10_000 }).recordCapFor('h1:small'), 3);
+  // Off, then on again: done again, and a cap is only raised.
+  createBilling(db, { env: {}, hardCap: 10_000 });
+  db.prepare("DELETE FROM records WHERE id = 'big-0'").run();
+  const again = createBilling(db, { env, hardCap: 10_000 });
+  assert.equal(again.recordCapFor('h1:small'), 9);
+  assert.equal(again.recordCapFor('h1:big'), 8, 'not lowered');
+  // Every record they hold counts, so the room is the free number again.
+  assert.equal(again.planRoom('h1:small').room, 3);
   // Off, or half configured: everyone keeps the registry's ceiling, as before.
   assert.equal(createBilling(db, { env: {}, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
   assert.equal(createBilling(db, { env: { ...env, BILLING_PADDLE_PRICES: '' }, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
@@ -326,9 +335,59 @@ test('a holder above the ceiling can still save edits; only new records are refu
   // The whole set re-sent, as the app does on every change: saved.
   const again = await saveAll(holder, kept);
   assert.equal(again.status, 200, JSON.stringify(again.json));
-  // Anything new in it: the plan's refusal, and nothing written.
-  const more = await saveAll(holder, [...kept, newRecord()]);
-  assert.equal(more.json.code, 'plan-limit');
+  // A new record waiting in the browser goes with every save: only it is refused, and the edit
+  // beside it is stored.
+  const stuck = newRecord();
+  const edited = { ...kept[0], strainName: 'S edited' };
+  const more = await saveAll(holder, [edited, kept[1], kept[2], stuck]);
+  assert.equal(more.status, 200, JSON.stringify(more.json));
+  assert.deepEqual(more.json.rejected?.map((r) => [r.id, r.code]), [[stuck.id, 'plan-limit']]);
+  assert.equal(more.json.count, 3);
+});
+
+test('an id that belongs to another holder is not counted as new', async () => {
+  const other = hex();
+  const theirs = newRecord();
+  assert.equal((await saveAll(other, [theirs])).json.ok, true);
+  const holder = hex();
+  const mine = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, mine)).json.ok, true);
+  // The same id with another proof code (the fingerprint rule would refuse a copy first).
+  const r = await saveAll(holder, [...mine, { ...theirs, recordFingerprint: hex() }]);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.deepEqual(r.json.notWritten, [theirs.id], JSON.stringify(r.json));
+  assert.equal(r.json.rejected, undefined, 'not refused for the plan');
+});
+
+const correctionOf = (r) => ({
+  id: recordId(),
+  recordFingerprint: hex(),
+  nonce: hex(),
+  strainName: 'S fixed',
+  supersedes: { recordId: r.id, changedFields: ['notes'], effectiveAt: '2026-11-08T09:30:00Z', reason: 'typo' },
+});
+
+test("a record's one correction doesn't count on the free plan; a correction of a correction does", async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  // At the free number: the correction of a record is stored all the same.
+  const fix = correctionOf(kept[0]);
+  const r = await saveAll(holder, [{ ...kept[0], supersededBy: fix.id }, fix]);
+  assert.equal(r.json.ok, true, JSON.stringify(r.json));
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+  // Correcting the correction would date a new proof code for free: it counts, so it is refused.
+  const fix2 = correctionOf(fix);
+  const r2 = await saveAll(holder, [fix2]);
+  assert.deepEqual(r2.json.rejected?.map((x) => x.code), ['plan-limit'], JSON.stringify(r2.json));
+});
+
+test("a record's free correction is used once: deleted and made again, it counts", () => {
+  const { db, b } = standalone();
+  db.prepare('INSERT INTO records VALUES (?, ?, ?)').run('r1', 'h1:a', '{}');
+  assert.equal(b.correctionIsFree('h1:a', 'r1'), true);
+  b.noteFreeCorrection('h1:a', 'r1');
+  assert.equal(b.correctionIsFree('h1:a', 'r1'), false);
 });
 
 test('on the free plan, deleting a record does not make room for another', async () => {
@@ -339,8 +398,12 @@ test('on the free plan, deleting a record does not make room for another', async
   assert.equal(del.status, 200, JSON.stringify(del.json));
   const p = await plan(holder);
   assert.deepEqual([p.json.recordsHeld, p.json.recordsCounted, p.json.recordCap], [2, 3, 3]);
-  assert.equal((await save(holder)).json.code, 'plan-limit');
+  assert.equal((await save(holder)).json.rejected?.[0]?.code, 'plan-limit');
   assert.equal((await date(holder, 1)).json.rejected?.[0]?.code, 'plan-limit');
+  // Saving the deleted record again (a backup) doesn't count it twice.
+  const back = await saveAll(holder, [records[0]]);
+  assert.equal(back.json.ok, true, JSON.stringify(back.json));
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
 });
 
 test('a checkout needs a record held', async () => {
@@ -365,9 +428,9 @@ const standalone = () => {
     const r = { code: 200, body: null };
     return { r, status(c) { r.code = c; return this; }, json(j) { r.body = j; return this; } };
   };
-  const checkoutId = async (holder) => {
+  const checkoutId = async (holder, ip = '10.0.0.1') => {
     const out = answer();
-    await b.checkout(holder, { plan: 'breeder' }, out);
+    await b.checkout(holder, { plan: 'breeder' }, out, ip);
     assert.equal(out.r.code, 200, JSON.stringify(out.r.body));
     return sent.at(-1).custom_data.veilcoreBillingId;
   };
@@ -405,6 +468,25 @@ test('past_due is paid for the grace from the first failed renewal, not to the n
   assert.equal(b.recordCapFor('h1:a'), 10_000);
 });
 
+test('cancelled after a failed renewal: paid only to the end of the period paid for, plus the grace', async () => {
+  const { db, clock, b, checkoutId, hook } = standalone();
+  db.prepare('INSERT INTO records VALUES (?, ?, ?)').run('r1', 'h1:a', '{}');
+  const bid = await checkoutId('h1:a');
+  const sub = subId();
+  const at = () => new Date(clock.t).toISOString();
+  const paidTo = new Date(clock.t + 30 * 86_400_000).toISOString();
+  hook(event('subscription.created', { billingId: bid, sub, endsAt: paidTo, occurredAt: at() }));
+  clock.t += 30 * 86_400_000;
+  const moved = new Date(clock.t + 30 * 86_400_000).toISOString();
+  hook(event('subscription.past_due', { sub, status: 'past_due', endsAt: moved, occurredAt: at() }));
+  clock.t += 86_400_000;
+  // Cancelled with no period of its own: the moved end isn't reached.
+  hook(event('subscription.canceled', { sub, status: 'canceled', endsAt: null, occurredAt: at() }));
+  assert.equal(b.recordCapFor('h1:a'), 10_000, 'within the grace');
+  clock.t += GRACE_MS;
+  assert.equal(b.recordCapFor('h1:a'), 3, 'not to the moved period end');
+});
+
 test('billing ids are kept at least seven days, whatever the number', async () => {
   const { db, clock, checkoutId } = standalone();
   db.prepare('INSERT INTO records VALUES (?, ?, ?)').run('r1', 'h1:a', '{}');
@@ -419,22 +501,25 @@ test('billing ids are kept at least seven days, whatever the number', async () =
   assert.equal(count(), 20);
 });
 
-test('received deliveries do not count against the free plan', () => {
-  const { db, b } = standalone();
+test('received deliveries do not count against the free plan, at switch-on or after', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT NOT NULL, body TEXT)');
   const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
   for (let i = 0; i < 2; i++) add.run(`own-${i}`, 'h1:a', '{}');
   for (let i = 0; i < 5; i++) add.run(`got-${i}`, 'h1:a', JSON.stringify({ receivedFrom: `VEIL-${i}` }));
-  // Seven held, two of their own: one more of their own fits under three.
-  assert.equal(b.ceilingPassed('h1:a', 7, 1), 0);
-  assert.equal(b.ceilingPassed('h1:a', 7, 2), 3);
+  // Seven held, two of their own: not grandfathered, and one more of their own fits under three.
+  const b = createBilling(db, { env, hardCap: 10_000 });
+  assert.equal(b.recordCapFor('h1:a'), 3);
+  assert.equal(b.planRoom('h1:a').room, 1);
   add.run('own-2', 'h1:a', '{}');
-  b.noteAdded('h1:a', 1);
-  assert.equal(b.ceilingPassed('h1:a', 8, 1), 3);
-  // Deleting one of their own doesn't give it back.
+  b.noteAdded('h1:a', ['own-2']);
+  assert.equal(b.planRoom('h1:a').room, 0);
+  // Deleting one of their own doesn't give it back; saving it again doesn't count it twice.
   db.prepare("DELETE FROM records WHERE id = 'own-0'").run();
-  assert.equal(b.ceilingPassed('h1:a', 7, 1), 3);
-  // Nothing new is never refused.
-  assert.equal(b.ceilingPassed('h1:a', 8, 0), 0);
+  assert.equal(b.planRoom('h1:a').room, 0);
+  b.noteAdded('h1:a', ['own-0']);
+  assert.equal(b.planRoom('h1:a').room, 0);
+  assert.equal(b.wasCounted('h1:a', 'own-0'), true);
 });
 
 test('checkout limits: ten per holder an hour, and fresh keys cannot reset anyone', async () => {
@@ -447,13 +532,31 @@ test('checkout limits: ten per holder an hour, and fresh keys cannot reset anyon
   assert.equal(out.code, 429);
   for (let i = 0; i < 50; i++) {
     add.run(`r-${i}`, `h1:flood-${i}`, '{}');
-    await checkoutId(`h1:flood-${i}`);
+    await checkoutId(`h1:flood-${i}`, `10.1.${i}.1`);
   }
   const still = { code: 200, status(c) { this.code = c; return this; }, json() { return this; } };
   await b.checkout('h1:a', { plan: 'breeder' }, still);
   assert.equal(still.code, 429, 'still limited this hour');
   clock.t += 3_600_000;
   await checkoutId('h1:a');
+});
+
+test('checkout limits: twenty per address an hour; Paddle failing uses up only attempts', async () => {
+  const { db, clock, b, checkoutId } = standalone();
+  const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
+  for (let i = 0; i < 21; i++) add.run(`r-${i}`, `h1:ip-${i}`, '{}');
+  for (let i = 0; i < 20; i++) await checkoutId(`h1:ip-${i}`, '10.2.2.2');
+  const out = { code: 200, status(c) { this.code = c; return this; }, json() { return this; } };
+  await b.checkout('h1:ip-20', { plan: 'breeder' }, out, '10.2.2.2');
+  assert.equal(out.code, 429);
+  // Another hour: Paddle down. Failures don't use up the ten checkouts a holder may open.
+  clock.t += 3_600_000;
+  const down = createBilling(db, { env, hardCap: 10_000, now: () => clock.t, fetchImpl: async () => { throw new TypeError('down'); } });
+  for (let i = 0; i < 12; i++) {
+    const o = { code: 200, status(c) { this.code = c; return this; }, json() { return this; } };
+    await down.checkout('h1:ip-0', { plan: 'breeder' }, o, `10.3.3.${i}`);
+    assert.equal(o.code, 502);
+  }
 });
 
 test('the webhook has its own rate window: a burst from one address is not refused', async () => {
@@ -471,20 +574,24 @@ test('the webhook has its own rate window: a burst from one address is not refus
 
 test('a plan and its counts follow the holder key when its stored form moves', () => {
   const { adoptPlaintextKey, storedHolderKey, legacyStoredHolderKey, HOLDER_KEY_COLUMNS } = require('../holder-key.js');
-  for (const t of ['billing_ids', 'billing_plans', 'billing_grandfathered', 'billing_added']) {
+  const tables = ['billing_ids', 'billing_plans', 'billing_grandfathered', 'billing_counted', 'billing_free_corrections'];
+  for (const t of tables) {
     assert.ok(HOLDER_KEY_COLUMNS.some(([table, col]) => table === t && col === 'holder_key'), t);
   }
   const { db } = standalone();
   for (const c of ['correction_conflict TEXT', 'first_seen INTEGER', 'updated_at INTEGER']) db.exec(`ALTER TABLE records ADD COLUMN ${c}`);
   const upper = hex().toUpperCase();
   const old = legacyStoredHolderKey(upper);
-  db.prepare("INSERT INTO billing_plans VALUES ('sub_01moved0000000001', ?, 'breeder', 'active', NULL, NULL, 1, 1)").run(old);
+  db.prepare(
+    "INSERT INTO billing_plans (subscription_id, holder_key, plan, status, occurred_at, updated_at) VALUES ('sub_01moved0000000001', ?, 'breeder', 'active', 1, 1)",
+  ).run(old);
   db.prepare('INSERT INTO billing_grandfathered VALUES (?, 9)').run(old);
-  db.prepare('INSERT INTO billing_added VALUES (?, 4)').run(old);
+  db.prepare("INSERT INTO billing_counted VALUES (?, 'c1')").run(old);
+  db.prepare("INSERT INTO billing_free_corrections VALUES (?, 't1')").run(old);
   db.prepare("INSERT INTO billing_ids VALUES ('d1', ?, 1)").run(old);
   adoptPlaintextKey(db, upper);
   const now = storedHolderKey(upper);
-  for (const t of ['billing_ids', 'billing_plans', 'billing_grandfathered', 'billing_added']) {
+  for (const t of tables) {
     assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE holder_key = ?`).get(now).n, 1, t);
   }
 });

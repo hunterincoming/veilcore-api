@@ -72,7 +72,8 @@ const HOLDER_KEY_COLUMNS = [
   ['billing_ids', 'holder_key'],
   ['billing_plans', 'holder_key'],
   ['billing_grandfathered', 'holder_key'],
-  ['billing_added', 'holder_key'],
+  ['billing_counted', 'holder_key'],
+  ['billing_free_corrections', 'holder_key'],
 ];
 
 /** Columns among HOLDER_KEY_COLUMNS that exist in this database. */

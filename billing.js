@@ -52,20 +52,25 @@ const BILLING_ID = /^[0-9a-f]{64}$/;
  *  so a checkout someone is still paying for always lands. */
 const BILLING_IDS_KEPT = 20;
 const BILLING_ID_MIN_AGE_MS = 7 * 86_400_000;
-/** Holders tracked for the checkout limit in one hour. Past it, new holders wait for the next
- *  hour: flooding with fresh keys can't reset anyone's count. */
-const CHECKOUT_HOLDERS_PER_HOUR = 5_000;
-/** Checkouts all holders together may open in an hour. */
-const CHECKOUTS_PER_HOUR_ALL = 2_000;
+/** Holders and addresses tracked for the checkout limits in one hour. Past it, new ones wait
+ *  for the next hour: flooding with fresh keys can't reset anyone's count. */
+const CHECKOUT_TRACKED_PER_HOUR = 50_000;
 const PADDLE_ID = /^[a-z]{2,4}_[0-9a-z]{10,64}$/;
 /** Paddle's two API hosts. A sandbox key works only on the sandbox one, and the reverse. */
 const PADDLE_API = { sandbox: 'https://sandbox-api.paddle.com', live: 'https://api.paddle.com' };
 /** A hosted checkout link: https://…paddle.io/checkout/hsc_… (set up in Paddle's dashboard). */
 const HOSTED_CHECKOUT = /^https:\/\/([a-z-]+\.)?paddle\.io\/checkout\/hsc_[0-9a-z]{10,64}$/;
-/** Checkouts one holder may open in an hour: each one is a transaction in Paddle. */
+/** Checkouts Paddle opened, per holder and per address, in an hour: each one is a transaction
+ *  in Paddle. Attempts (Paddle refusing or down included) are limited more loosely, so an
+ *  outage doesn't use up anyone's checkouts but nobody can make billing ids without end. */
 const CHECKOUTS_PER_HOUR = 10;
+const CHECKOUTS_PER_HOUR_PER_IP = 20;
+const ATTEMPTS_PER_HOUR = 30;
+const ATTEMPTS_PER_HOUR_PER_IP = 60;
 
 const digest = (s) => createHash('sha256').update(`veilcore:billing-id:v1:${s}`).digest('hex');
+/** A record id as kept in billing_counted: digested, so the table names no record. */
+const idDigest = (id) => createHash('sha256').update(`veilcore:billing-counted:v1:${id}`).digest('hex');
 
 /**
  * Read the billing settings from the environment. Anything malformed switches billing off
@@ -158,6 +163,7 @@ const createBilling = (
       status TEXT NOT NULL,
       period_end INTEGER,
       past_due_since INTEGER,
+      paid_through INTEGER,
       occurred_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -166,9 +172,9 @@ const createBilling = (
       event_id TEXT PRIMARY KEY,
       received_at INTEGER NOT NULL
     );
-    -- Holders above the free number on the day billing was first switched on keep what they
-    -- hold and may add the free number again, for good: nobody is cut off by a change they
-    -- didn't choose.
+    -- Holders above the free number when billing is switched on keep what they hold and may add
+    -- the free number again, for good: nobody is cut off by a change they didn't choose. Done
+    -- each time billing goes from off to on; a cap is only ever raised.
     -- Not unique on holder_key: the holder-key migration (holder-key.js) moves rows from an
     -- old key form to the new one, and two forms of one key may each have a row.
     CREATE TABLE IF NOT EXISTS billing_grandfathered (
@@ -176,14 +182,20 @@ const createBilling = (
       cap INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS billing_grandfathered_holder ON billing_grandfathered(holder_key);
-    -- Records a holder added while billing was on, never lowered: on the free plan this is
-    -- what counts, so deleting a record doesn't make room for another. Rows per key form are
-    -- summed, as above. Received deliveries are not counted.
-    CREATE TABLE IF NOT EXISTS billing_added (
+    -- The records that count against the free plan, one row per record id (digested), never
+    -- removed: deleting a record doesn't make room, and saving a deleted id again doesn't count
+    -- twice. Received deliveries and a record's one correction are not counted.
+    CREATE TABLE IF NOT EXISTS billing_counted (
       holder_key TEXT NOT NULL,
-      n INTEGER NOT NULL
+      id_digest TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS billing_added_holder ON billing_added(holder_key);
+    CREATE INDEX IF NOT EXISTS billing_counted_holder ON billing_counted(holder_key, id_digest);
+    -- Records whose one free correction was used: a correction deleted and made again counts.
+    CREATE TABLE IF NOT EXISTS billing_free_corrections (
+      holder_key TEXT NOT NULL,
+      target_digest TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS billing_free_corrections_holder ON billing_free_corrections(holder_key, target_digest);
     CREATE TABLE IF NOT EXISTS billing_meta (
       k TEXT PRIMARY KEY,
       v TEXT NOT NULL
@@ -192,38 +204,73 @@ const createBilling = (
   const config = billingConfig(env, hardCap);
   if (!config.enabled && (env.BILLING ?? '') !== '') console.error(`billing stays off: ${config.reason}`);
 
-  if (config.enabled) {
-    const done = db.prepare("SELECT v FROM billing_meta WHERE k = 'grandfathered_at'").get();
-    if (!done) {
-      db.transaction(() => {
-        db.prepare(
-          `INSERT INTO billing_grandfathered (holder_key, cap)
-           SELECT holder_key, COUNT(*) + ? FROM records GROUP BY holder_key HAVING COUNT(*) > ?`,
-        ).run(config.free, config.free);
-        db.prepare("INSERT INTO billing_meta (k, v) VALUES ('grandfathered_at', ?)").run(String(now()));
-      })();
-    }
+  // Added before paid_through existed (a sandbox database): the column is added in place.
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('billing_plans') WHERE name = 'paid_through'").get()) {
+    db.exec('ALTER TABLE billing_plans ADD COLUMN paid_through INTEGER');
   }
 
-  const plansOf = db.prepare('SELECT plan, status, period_end, past_due_since FROM billing_plans WHERE holder_key = ?');
+  // The records that count: a holder's own (not received deliveries), less a record's one
+  // correction (a row correcting a record of the same holder that isn't itself a correction).
+  const COUNTS = `json_extract(r.body, '$.receivedFrom') IS NULL AND NOT EXISTS (
+    SELECT 1 FROM records t WHERE t.id = json_extract(r.body, '$.supersedes.recordId')
+      AND t.holder_key = r.holder_key AND json_extract(t.body, '$.supersedes') IS NULL)`;
+  const wasOn = db.prepare("SELECT v FROM billing_meta WHERE k = 'last_start'").get()?.v === 'on';
+  if (config.enabled && !wasOn) {
+    // Switched on (first time, or again after a spell off): grandfather from what each holder
+    // holds that counts, and count every such record not counted yet. A cap is only raised.
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO billing_grandfathered (holder_key, cap)
+         SELECT r.holder_key, COUNT(*) + ? FROM records r WHERE ${COUNTS} GROUP BY r.holder_key HAVING COUNT(*) > ?`,
+      ).run(config.free, config.free);
+      const add = db.prepare(
+        `INSERT INTO billing_counted (holder_key, id_digest) SELECT ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM billing_counted WHERE holder_key = ? AND id_digest = ?)`,
+      );
+      for (const r of db.prepare(`SELECT r.id, r.holder_key FROM records r WHERE ${COUNTS}`).all()) {
+        const d = idDigest(r.id);
+        add.run(r.holder_key, d, r.holder_key, d);
+      }
+      // The free corrections already made are used.
+      const used = db.prepare(
+        `INSERT INTO billing_free_corrections (holder_key, target_digest) SELECT ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM billing_free_corrections WHERE holder_key = ? AND target_digest = ?)`,
+      );
+      for (const r of db.prepare(`SELECT r.holder_key, json_extract(r.body, '$.supersedes.recordId') AS target
+                                  FROM records r WHERE NOT (${COUNTS}) AND json_extract(r.body, '$.receivedFrom') IS NULL`).all()) {
+        const d = idDigest(r.target);
+        used.run(r.holder_key, d, r.holder_key, d);
+      }
+    })();
+  }
+  db.prepare("INSERT INTO billing_meta (k, v) VALUES ('last_start', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(
+    config.enabled ? 'on' : 'off',
+  );
+
+  const plansOf = db.prepare(
+    'SELECT plan, status, period_end, past_due_since, paid_through FROM billing_plans WHERE holder_key = ?',
+  );
   const grandfatheredOf = db.prepare('SELECT MAX(cap) AS cap FROM billing_grandfathered WHERE holder_key = ?');
-  const addedOf = db.prepare('SELECT COUNT(*) AS rows, COALESCE(SUM(n), 0) AS n FROM billing_added WHERE holder_key = ?');
-  const ownHeld = db.prepare(
-    "SELECT COUNT(*) AS n FROM records WHERE holder_key = ? AND json_extract(body, '$.receivedFrom') IS NULL",
-  );
-  const bumpAdded = db.prepare(
-    'UPDATE billing_added SET n = n + ? WHERE rowid = (SELECT rowid FROM billing_added WHERE holder_key = ? LIMIT 1)',
-  );
-  const insertAdded = db.prepare('INSERT INTO billing_added (holder_key, n) VALUES (?, ?)');
+  const countedOf = db.prepare('SELECT COUNT(DISTINCT id_digest) AS n FROM billing_counted WHERE holder_key = ?');
+  const isCounted = db.prepare('SELECT 1 FROM billing_counted WHERE holder_key = ? AND id_digest = ? LIMIT 1');
+  const addCounted = db.prepare('INSERT INTO billing_counted (holder_key, id_digest) VALUES (?, ?)');
+  const dropCounted = db.prepare('DELETE FROM billing_counted WHERE holder_key = ? AND id_digest = ?');
+  const freeUsed = db.prepare('SELECT 1 FROM billing_free_corrections WHERE holder_key = ? AND target_digest = ? LIMIT 1');
+  const addFreeUsed = db.prepare('INSERT INTO billing_free_corrections (holder_key, target_digest) VALUES (?, ?)');
 
   /** The best plan this holder has right now, or null. */
   const currentPlan = (holder) => {
     const t = now();
     let best = null;
     for (const p of plansOf.all(holder)) {
+      // Cancelled or paused after a failed renewal: Paddle had already moved the period on, so
+      // paid only to the end of the period that was paid for, and never past the grace.
+      const until = p.past_due_since
+        ? Math.min((p.paid_through ?? p.period_end ?? 0) + GRACE_MS, p.past_due_since + GRACE_MS)
+        : (p.period_end ?? 0) + GRACE_MS;
       const paid =
         PAID_NOW.has(p.status) ||
-        (PAID_UNTIL_END.has(p.status) && p.period_end && t < p.period_end + GRACE_MS) ||
+        (PAID_UNTIL_END.has(p.status) && p.period_end && t < until) ||
         (p.status === PAST_DUE && p.past_due_since && t < p.past_due_since + GRACE_MS);
       if (paid && (!best || (p.period_end ?? Infinity) > (best.periodEnd ?? 0))) {
         best = { plan: p.plan, status: p.status, periodEnd: p.period_end ?? null };
@@ -240,32 +287,39 @@ const createBilling = (
     return Math.min(hardCap, Math.max(config.free, g?.cap ?? 0));
   };
 
-  /** Records that count against the free plan: those added since billing went on, starting
-   *  from what the holder held themselves (not received) the first time it was asked. */
-  const usedOf = (holder) => {
-    const a = addedOf.get(holder);
-    return a.rows ? a.n : ownHeld.get(holder).n;
-  };
+  /** Records that count against the free plan (billing_counted): deleted ones included. */
+  const usedOf = (holder) => countedOf.get(holder).n;
 
   /**
-   * Whether adding `fresh` new records would go past this holder's ceiling, given `held`
-   * now. A save that adds nothing is never refused: stopping payment never stops edits.
-   * Returns the ceiling it would pass, or 0.
+   * How many more counted records this holder may add on their plan now: Infinity when billing
+   * is off or the plan is paid (the registry's own ceiling still applies, by records held).
+   * Returns { room, cap } so a refusal can say which ceiling it was.
    */
-  const ceilingPassed = (holder, held, fresh) => {
-    if (!(fresh > 0)) return 0;
-    if (held + fresh > hardCap) return hardCap;
-    if (!config.enabled || currentPlan(holder)) return 0;
+  const planRoom = (holder) => {
+    if (!config.enabled || currentPlan(holder)) return { room: Infinity, cap: hardCap };
     const cap = recordCapFor(holder);
-    return usedOf(holder) + fresh > cap ? cap : 0;
+    return { room: Math.max(0, cap - usedOf(holder)), cap };
   };
 
-  /** Count `n` records just added (call inside the transaction that added them). */
-  const noteAdded = (holder, n) => {
-    if (!config.enabled || !(n > 0)) return;
-    if (bumpAdded.run(n, holder).changes) return;
-    // First count for this holder: what they held of their own before these n.
-    insertAdded.run(holder, Math.max(0, ownHeld.get(holder).n - n) + n);
+  /** Whether this record id already counted for this holder (it was added, maybe deleted since). */
+  const wasCounted = (holder, id) => !!isCounted.get(holder, idDigest(id));
+
+  /** Count records just added (call inside the transaction that added them). Each id once. */
+  const noteAdded = (holder, ids) => {
+    if (!config.enabled) return;
+    for (const id of ids) if (!wasCounted(holder, id)) addCounted.run(holder, idDigest(id));
+  };
+
+  /** Whether this record's one free correction is still to be used. Off: always (nothing counts). */
+  const correctionIsFree = (holder, target) => !config.enabled || !freeUsed.get(holder, idDigest(target));
+  /** The free correction of this record was used (call inside the transaction that stored it). */
+  const noteFreeCorrection = (holder, target) => {
+    if (config.enabled && correctionIsFree(holder, target)) addFreeUsed.run(holder, idDigest(target));
+  };
+
+  /** A record counted when only its proof code was dated, now stored as a free correction. */
+  const uncount = (holder, id) => {
+    if (config.enabled) dropCounted.run(holder, idDigest(id));
   };
 
   const pruneIds = db.prepare(
@@ -279,13 +333,21 @@ const createBilling = (
   const forgetEvents = db.prepare('DELETE FROM billing_events WHERE received_at < ?');
   const planRow = db.prepare('SELECT occurred_at, holder_key FROM billing_plans WHERE subscription_id = ?');
   const upsertPlan = db.prepare(
-    `INSERT INTO billing_plans (subscription_id, holder_key, plan, status, period_end, past_due_since, occurred_at, updated_at)
-     VALUES (@sub, @holder, @plan, @status, @periodEnd, @pastDueSince, @occurredAt, @updatedAt)
+    `INSERT INTO billing_plans (subscription_id, holder_key, plan, status, period_end, past_due_since, paid_through, occurred_at, updated_at)
+     VALUES (@sub, @holder, @plan, @status, @periodEnd, @pastDueSince, NULL, @occurredAt, @updatedAt)
      ON CONFLICT(subscription_id) DO UPDATE SET
        plan = excluded.plan, status = excluded.status,
        period_end = COALESCE(excluded.period_end, billing_plans.period_end),
-       past_due_since = CASE WHEN excluded.status = 'past_due'
-         THEN COALESCE(billing_plans.past_due_since, excluded.past_due_since) ELSE NULL END,
+       -- A failed renewal is remembered until it is paid (active or trialing again), with the
+       -- end of the period that was paid for: a cancel after it doesn't reach the moved end.
+       past_due_since = CASE
+         WHEN excluded.status = 'past_due' THEN COALESCE(billing_plans.past_due_since, excluded.past_due_since)
+         WHEN excluded.status IN ('active', 'trialing') THEN NULL
+         ELSE billing_plans.past_due_since END,
+       paid_through = CASE
+         WHEN excluded.status = 'past_due' AND billing_plans.past_due_since IS NULL THEN billing_plans.period_end
+         WHEN excluded.status IN ('active', 'trialing') THEN NULL
+         ELSE billing_plans.paid_through END,
        occurred_at = excluded.occurred_at, updated_at = excluded.updated_at`,
   );
 
@@ -379,16 +441,17 @@ const createBilling = (
     return res.status(r.status).json(r.body);
   };
 
-  const checkoutsBy = new Map(); // holder -> checkouts opened this hour
+  // This hour's counts, per holder and per address: { attempts, opened }.
+  const byHolder = new Map();
+  const byIp = new Map();
   let checkoutHour = -1;
-  let checkoutsAll = 0;
   const holdsARecord = db.prepare('SELECT 1 FROM records WHERE holder_key = ? LIMIT 1');
   /**
    * POST /api/billing/checkout { plan }, for the holder in `holder` (the stored key). Opens a
    * transaction in Paddle carrying a new billing id, and answers the hosted checkout link for
    * it. The billing id never leaves the registry except to Paddle.
    */
-  const checkout = async (holder, body, res) => {
+  const checkout = async (holder, body, res, ip = '') => {
     if (!config.enabled) return off(res);
     if (!holder) return res.status(401).json({ error: 'holder key required' });
     const price = config.priceOfPlan.get(body?.plan);
@@ -399,15 +462,24 @@ const createBilling = (
     const hour = Math.floor(now() / 3_600_000);
     if (hour !== checkoutHour) {
       checkoutHour = hour;
-      checkoutsAll = 0;
-      checkoutsBy.clear(); // only last hour's counts: every one of them has expired
+      byHolder.clear(); // only last hour's counts: every one of them has expired
+      byIp.clear();
     }
     const busy = () => res.status(429).json({ error: 'too many checkouts opened; try again in an hour' });
-    if (!checkoutsBy.has(holder) && checkoutsBy.size >= CHECKOUT_HOLDERS_PER_HOUR) return busy();
-    const count = (checkoutsBy.get(holder) ?? 0) + 1;
-    if (count > CHECKOUTS_PER_HOUR || checkoutsAll >= CHECKOUTS_PER_HOUR_ALL) return busy();
-    checkoutsBy.set(holder, count);
-    checkoutsAll++;
+    const slot = (map, k) => {
+      if (map.has(k)) return map.get(k);
+      if (map.size >= CHECKOUT_TRACKED_PER_HOUR) return null;
+      const c = { attempts: 0, opened: 0 };
+      map.set(k, c);
+      return c;
+    };
+    const h = slot(byHolder, holder);
+    const a = slot(byIp, ip);
+    if (!h || !a) return busy();
+    if (h.opened >= CHECKOUTS_PER_HOUR || a.opened >= CHECKOUTS_PER_HOUR_PER_IP) return busy();
+    if (h.attempts >= ATTEMPTS_PER_HOUR || a.attempts >= ATTEMPTS_PER_HOUR_PER_IP) return busy();
+    h.attempts++;
+    a.attempts++;
     const billingId = issueId(holder);
     let txn;
     try {
@@ -424,6 +496,8 @@ const createBilling = (
       console.warn(`billing: Paddle unreachable for a checkout (${e?.name ?? 'error'})`);
     }
     if (!txn) return res.status(502).json({ error: 'the payment provider could not open a checkout; try again shortly' });
+    h.opened++;
+    a.opened++;
     return res.json({ url: `${config.checkout}?transaction_id=${encodeURIComponent(txn)}` });
   };
 
@@ -448,8 +522,12 @@ const createBilling = (
     enabled: config.enabled,
     plans: config.enabled ? [...config.priceOfPlan.keys()] : [],
     recordCapFor,
-    ceilingPassed,
+    planRoom,
+    wasCounted,
     noteAdded,
+    uncount,
+    correctionIsFree,
+    noteFreeCorrection,
     webhook,
     checkout,
     planOf,

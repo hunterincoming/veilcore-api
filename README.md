@@ -1663,8 +1663,10 @@ card, and handles sales tax. This registry keeps none of those.
   checkout link for that transaction. The site sends the holder to Paddle's own page; the
   page holding their keys never loads a payment company's script. The billing id is never
   shown to anyone. The last 20 a holder was given keep working, and none goes before it is 7
-  days old. A checkout needs a record held (409 otherwise). Ten checkouts an hour per holder,
-  2,000 an hour in all. Paddle refusing or unreachable: 502.
+  days old. A checkout needs a record held (409 otherwise). Ten checkouts Paddle opened an hour
+  per holder and twenty per address; attempts (Paddle refusing or down) are limited separately
+  (30 per holder, 60 per address), so an outage doesn't use up anyone's checkouts. Paddle
+  refusing or unreachable: 502.
 - **Webhook.** `POST /api/billing/paddle`, raw body. Counted only with a valid
   `Paddle-Signature` (`ts=…;h1=…`, HMAC-SHA256 of `ts:body` with the destination's secret, any
   `h1` during a rotation), a timestamp within 5 minutes, and an event id not seen in 30 days.
@@ -1675,20 +1677,27 @@ card, and handles sales tax. This registry keeps none of those.
   The webhook has its own rate window (1,200 a minute per address).
 - **The ceiling.** A paid plan keeps up to 10,000 records, while `active` or `trialing`, while
   `paused` or `canceled` until its period ends plus 7 days, and while `past_due` for 7 days
-  from the first failed renewal. Otherwise `BILLING_FREE_RECORDS`, counted as records added
-  while billing is on (deleting one doesn't make room). Only new records are refused, with
-  `code: "plan-limit"`: a save that adds nothing always goes through, so edits never stop.
-  Nothing already held is touched, and records keep verifying.
-- **Switching on.** Holders over the free number that day keep what they hold and may add the
-  free number again, for good (done once, at the first start with billing on).
-- **Not counted.** Receiving a delivery (a lab or grower can always take what was sent), and
-  licences.
+  from the first failed renewal (cancelled after a failed renewal: to the end of the period
+  paid for, plus 7 days, never past 7 days from the failure). Otherwise `BILLING_FREE_RECORDS`,
+  counted per record id (`billing_counted`, digested): deleting one doesn't make room, and
+  saving a deleted id again doesn't count it twice. Only the new rows past a ceiling are
+  refused, each in `rejected` with `code: "plan-limit"`; the rest of the save is stored, so a
+  new record waiting in a browser never blocks edits. Nothing already held is touched, and
+  records keep verifying.
+- **Switching on.** Each time billing goes from off to on: holders over the free number keep
+  what they hold and may add the free number again, for good (a cap is only raised), and
+  every record they hold that counts is counted.
+- **Not counted.** Receiving a delivery (a lab or grower can always take what was sent),
+  licences, and a record's one correction (a correction of a record that isn't itself a
+  correction, once per record, ever: a correction of a correction, or a correction deleted and
+  made again, counts).
 - `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordsCounted,
   recordCap, plans }`.
 - The billing tables follow a holder key when its stored form moves (`holder-key.js`).
 
 Stored: billing id digests, holder digest, plan, status, period end, Paddle subscription id,
-records added on the free plan (a count), event ids for 30 days. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
+digests of the record ids counted on the free plan and of the records whose free correction
+was used, event ids for 30 days. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
 
 ## Other limits worth knowing (round D, 4 Oct 2026)
 
