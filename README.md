@@ -646,10 +646,14 @@ Body `{ "ids": [...] }`, the holder's own ids. Answers `{ ok, removed, notRemove
 A deleted id stays deleted (`tombstones.js`, table `record_tombstones`). A later save or dating
 row of that id is refused per row with `code: "deleted"`, from any holder: a save already on
 its way, another tab or a restored backup can't bring it back, and nobody can reuse the id. A
-proof code not yet in a batch is never batched. `GET /verify/:id` answers 404 with
-`{ found: false, deleted: true, deletedBy: "record-holder", deletedAt, anchored, anchor? }`:
-an anchor made before the deletion is on the ledger and is still named. `/health` lists
-`record-tombstones-v1`.
+proof code not yet in a batch is never batched, including one deleted while a batch is being
+built (the seal checks again inside its write). A correction link (`supersedes`,
+`supersededBy`) can't newly name a deleted id. `GET /verify/:id` answers 404 with
+`{ found: false, deleted: true, deletedBy: "record-holder", deletedAt, recordFingerprint?,
+anchored, anchor?, anchoredRelativeToDeletion? }`: `deletedAt` is to the minute; the proof code
+lets a check page tie its link to the record before reporting a date; an anchor is still named,
+with whether it landed `before` or `after` the deletion (a batch sealed before can be anchored
+after). `/health` lists `record-tombstones-v1`.
 
 ### Obligations (round 3, P5)
 

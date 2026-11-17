@@ -109,7 +109,8 @@ test('a record deleted after its batch was anchored: the check link still names 
   await date(holder, [{ id, recordFingerprint: fp }]);
   const { batchId } = (await call('POST', '/batches/seal', undefined, {}, operator)).json;
   const tx = 'ab'.repeat(32);
-  const anchored = await call('POST', `/batches/${batchId}/anchor`, undefined, { network: 'mainnet', contractAddress: CONTRACT, txHash: tx, blockHeight: 7 }, operator);
+  const anchoredAt = new Date(Date.now() - 1000).toISOString();
+  const anchored = await call('POST', `/batches/${batchId}/anchor`, undefined, { network: 'mainnet', contractAddress: CONTRACT, txHash: tx, blockHeight: 7, anchoredAt }, operator);
   assert.equal(anchored.status, 200, JSON.stringify(anchored.json));
   await remove(holder, [id]);
   const v = await call('GET', `/verify/${id}`);
@@ -117,6 +118,56 @@ test('a record deleted after its batch was anchored: the check link still names 
   assert.equal(v.json.anchored, true);
   assert.equal(v.json.anchor.txHash, tx);
   assert.equal(v.json.anchorCheckedOnChain, false);
+  assert.equal(v.json.anchoredRelativeToDeletion, 'before');
+  // The proof code, so a check page can tie its link to this record; the time to the minute.
+  assert.equal(v.json.recordFingerprint, fp);
+  assert.match(v.json.deletedAt, /:00\.000Z$/);
+});
+
+test('a batch sealed before the deletion but anchored after it says so', async () => {
+  const holder = hex();
+  const id = recordId();
+  const fp = hex();
+  await date(holder, [{ id, recordFingerprint: fp }]);
+  const { batchId } = (await call('POST', '/batches/seal', undefined, {}, operator)).json;
+  await remove(holder, [id]);
+  const anchoredAt = new Date(Date.now() + 2000).toISOString();
+  const anchored = await call('POST', `/batches/${batchId}/anchor`, undefined, { network: 'mainnet', contractAddress: CONTRACT, txHash: 'cd'.repeat(32), blockHeight: 8, anchoredAt }, operator);
+  assert.equal(anchored.status, 200, JSON.stringify(anchored.json));
+  const v = await call('GET', `/verify/${id}`);
+  assert.equal(v.json.anchored, true);
+  assert.equal(v.json.anchoredRelativeToDeletion, 'after');
+});
+
+test('a record deleted while a batch is being built is left out of it', async () => {
+  const { createBatches } = await import('../lineage/batches.mjs');
+  const Database = require('better-sqlite3');
+  const mem = new Database(':memory:');
+  mem.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT, body TEXT)');
+  const keep = { id: recordId(), fp: hex() };
+  const drop = { id: recordId(), fp: hex() };
+  for (const r of [keep, drop]) {
+    mem.prepare('INSERT INTO records (id, holder_key, body) VALUES (?, ?, ?)').run(r.id, 'h', JSON.stringify({ recordFingerprint: r.fp }));
+  }
+  const b = createBatches(mem);
+  const sealing = b.seal();
+  // seal() has read the pending set and is awaiting the tree; the delete lands now.
+  mem.prepare('DELETE FROM records WHERE id = ?').run(drop.id);
+  const out = await sealing;
+  assert.equal(out.recordCount, 1, JSON.stringify(out));
+  assert.ok(b.proofFor(keep.fp));
+  assert.equal(b.proofFor(drop.fp), null);
+});
+
+test('a correction link can’t name a deleted record', async () => {
+  const holder = hex();
+  const stranger = hex();
+  const id = recordId();
+  await date(holder, [{ id, recordFingerprint: hex() }]);
+  await remove(holder, [id]);
+  const fix = sealForTest({ id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'Fix', supersedes: { recordId: id, fields: ['strainName'], at: new Date().toISOString() } }, randomBytes(32));
+  const r = await call('PUT', '/api/records', stranger, [fix]);
+  assert.equal(r.json.rejected?.[0]?.code, 'deleted', JSON.stringify(r.json));
 });
 
 test('an id never stored still answers plain not found, and deleting someone else’s record leaves no tombstone', async () => {

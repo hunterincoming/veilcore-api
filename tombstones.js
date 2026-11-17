@@ -19,7 +19,7 @@ const setupTombstones = (db) => {
       deleted_at  INTEGER NOT NULL
     );
   `);
-  const getOne = db.prepare('SELECT id, fingerprint, deleted_at FROM record_tombstones WHERE id = ?');
+  const getOne = db.prepare('SELECT id, holder_key, fingerprint, deleted_at FROM record_tombstones WHERE id = ?');
   const put = db.prepare(
     `INSERT INTO record_tombstones (id, holder_key, fingerprint, deleted_at) VALUES (?, ?, ?, ?)
      ON CONFLICT(id) DO NOTHING`,
@@ -31,6 +31,12 @@ const setupTombstones = (db) => {
     mark: (id, holder, fingerprint, at) => put.run(id, holder, typeof fingerprint === 'string' ? fingerprint : null, at),
     /** The per-row refusal for a save of a deleted id. */
     refusal: (id) => ({ id: String(id).slice(0, 128), reason: DELETED_REASON, code: DELETED_CODE }),
+    /** The per-row refusal for a save whose correction link names a deleted id. */
+    linkRefusal: (id, field) => ({
+      id: String(id).slice(0, 128),
+      reason: `${field} names a record that was deleted by its holder; nothing was changed`,
+      code: DELETED_CODE,
+    }),
   };
 };
 

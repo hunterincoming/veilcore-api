@@ -1297,6 +1297,16 @@ app.put('/api/records', (req, res) => {
     // One entry per id, the last copy sent (round 2): the same id several times in one
     // save was each counted against the stored row, so small copies followed by a big one
     // read as a save that shrank the set, while the big one was what got stored.
+    const priorLinkBody = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
+    const newLinkToDeleted = (id, field, target) => {
+      const gone = tombstones.of(target);
+      if (!gone) return false;
+      if (gone.holder_key !== holder) return true;
+      const prior = priorLinkBody.get(id, holder);
+      if (!prior) return true;
+      const b = JSON.parse(prior.body);
+      return (field === 'supersedes' ? b.supersedes?.recordId : b.supersededBy) !== target;
+    };
     const plan = new Map();
     for (const item of items) {
       // A record may only be marked superseded by a record of the same holder. Ids were
@@ -1308,6 +1318,12 @@ app.put('/api/records', (req, res) => {
           rejected.push({ id: item.id, reason: 'supersededBy names a record that belongs to another holder; nothing was changed' });
           continue;
         }
+        // A deleted id can't become a link target, or a stranger's record could publicly
+        // "correct" it. A link this holder already stored is left as it was.
+        if (!target && newLinkToDeleted(item.id, 'supersededBy', item.supersededBy)) {
+          rejected.push(tombstones.linkRefusal(item.id, 'supersededBy'));
+          continue;
+        }
       }
       // The same for the other direction: a record may only claim to correct a record of
       // its own holder, or the public view would say it corrects someone else's.
@@ -1316,6 +1332,10 @@ app.put('/api/records', (req, res) => {
         const target = holderOfId.get(corrected);
         if (target && target.holder_key !== holder) {
           rejected.push({ id: item.id, reason: 'supersedes names a record that belongs to another holder' });
+          continue;
+        }
+        if (!target && newLinkToDeleted(item.id, 'supersedes', corrected)) {
+          rejected.push(tombstones.linkRefusal(item.id, 'supersedes'));
           continue;
         }
       }
@@ -2485,13 +2505,28 @@ app.get('/verify/:id', (req, res) => {
     const gone = tombstones.of(req.params.id);
     if (!gone) return res.status(404).json({ found: false });
     const proof = batches && gone.fingerprint ? batches.proofFor(gone.fingerprint) : null;
+    // The proof code is public (it is what a check link carries), so a page can tie its link
+    // to this record before it reports any date. The time is to the minute: enough to read.
+    const anchoredAt = proof?.anchor ? Date.parse(proof.anchor.anchoredAt) : NaN;
     return res.status(404).json({
       found: false,
       deleted: true,
       deletedBy: 'record-holder',
-      deletedAt: new Date(gone.deleted_at).toISOString(),
+      deletedAt: new Date(Math.floor(gone.deleted_at / 60_000) * 60_000).toISOString(),
+      ...(gone.fingerprint ? { recordFingerprint: gone.fingerprint } : {}),
       anchored: Boolean(proof && proof.anchor),
-      ...(proof && proof.anchor ? { anchor: proof.anchor, anchorCheckedOnChain: false } : {}),
+      ...(proof && proof.anchor
+        ? {
+            anchor: proof.anchor,
+            anchorCheckedOnChain: false,
+            // A batch sealed before the deletion can be anchored after it.
+            anchoredRelativeToDeletion: Number.isFinite(anchoredAt)
+              ? anchoredAt < gone.deleted_at
+                ? 'before'
+                : 'after'
+              : 'unknown',
+          }
+        : {}),
     });
   }
   const r = JSON.parse(row.body);
