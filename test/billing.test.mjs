@@ -123,6 +123,11 @@ const send = async (ev, { signature, raw } = {}) => {
 };
 const subId = () => `sub_01${hex(10)}`;
 
+test('/health lists billing-v1 while billing is on', async () => {
+  const h = await (await fetch(`${base}/health`)).json();
+  assert.ok(h.features.includes('billing-v1'));
+});
+
 test('free: three records, then the save and the dating route both refuse, saying it is the plan', async () => {
   const holder = hex();
   assert.equal((await date(holder, 2)).status, 200);

@@ -726,6 +726,9 @@ const featuresServed = () => [
   // before its locked copy, so the record goes into the next batch at once; the locked copy
   // later must carry the same proof code. A site that dates first needs a registry that takes it.
   'dating-first-v1',
+  // Paid plans (billing.js): listed only while BILLING=on and fully configured, so a site built
+  // with paid plans (VITE_PAID_PLANS=on) refuses to deploy against a registry without them.
+  ...(billing.enabled ? ['billing-v1'] : []),
   // Lab signatures are private (8 Nov 2026, README "Lab signatures: who sees them"): lab reports,
   // receipts and a lab key's other signatures are served only to the holder, the delivery's
   // parties and the lab, and /verify answers the ones the holder shares (grant value

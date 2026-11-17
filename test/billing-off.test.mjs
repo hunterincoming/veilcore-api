@@ -35,6 +35,11 @@ const call = async (method, path, holder, body) => {
   return { status: res.status, json: await res.json() };
 };
 
+test('off: /health does not list billing-v1', async () => {
+  const h = await (await fetch(`${base}/health`)).json();
+  assert.ok(!h.features.includes('billing-v1'));
+});
+
 test('off: billing routes answer 404 and a webhook is not read', async () => {
   const holder = hex();
   assert.equal((await call('POST', '/api/billing/checkout', holder, { plan: 'breeder' })).status, 404);
