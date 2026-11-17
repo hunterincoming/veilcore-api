@@ -494,6 +494,9 @@ const LICENCE_BODY_LIMIT = 4 * 1024 * 1024;
 app.put('/api/licenses', express.json({ limit: LICENCE_BODY_LIMIT, verify: countWriteBytes }));
 // A passkey copy of a backup can be larger than other bodies (lineage/passkey-vault.mjs).
 app.put('/vault/:id', express.json({ limit: '3mb', verify: countWriteBytes }));
+// Paddle's webhook for paid plans (billing.js): its signature is over the body's exact bytes,
+// so it gets them raw, before the JSON parser below. Off unless BILLING=on.
+app.post('/api/billing/paddle', express.raw({ type: '*/*', limit: '256kb' }), (req, res) => billing.webhook(req, res));
 app.use(express.json({ limit: '512kb', verify: countWriteBytes }));
 
 /**
@@ -521,6 +524,20 @@ app.use((req, res, next) => {
 // carry everything a holder may keep (the body limit on this route is raised to match).
 const MAX_PER_REQUEST = 10_000;
 const MAX_PER_HOLDER = 10_000;
+/**
+ * Paid plans (billing.js). Off unless BILLING=on: then every holder's ceiling is
+ * MAX_PER_HOLDER, as it always was. On, a holder without a paid plan may keep the free
+ * number (BILLING_FREE_RECORDS), or what they held on the day it was switched on plus that.
+ * Receiving a delivery (lineage/transfer.mjs) keeps MAX_PER_HOLDER: a lab or grower can
+ * always take what was sent to them. Licences are not counted against a plan.
+ */
+const { createBilling } = require('./billing.js');
+const billing = createBilling(db, { env: process.env, hardCap: MAX_PER_HOLDER });
+/** The refusal when a save would go past a holder's ceiling: says which ceiling it is. */
+const capRefusal = (cap) =>
+  cap < MAX_PER_HOLDER
+    ? { error: `the free plan keeps ${cap} records here; a paid plan keeps more`, code: 'plan-limit', cap }
+    : { error: `a holder may keep at most ${MAX_PER_HOLDER} records here` };
 /**
  * Most bytes one holder may keep, in records and (separately) in licences. The count alone
  * allowed 10,000 × 64 KB, about 640 MB under one key anyone can make, and every read of the
@@ -558,6 +575,14 @@ const storedKeyOf = (req) => {
   const raw = holderOf(req);
   return raw ? storedHolderKey(raw) : '';
 };
+
+// Paid plans (billing.js): a billing id to hand Paddle's checkout, and the holder's plan.
+const recordsHeldBy = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?');
+app.post('/api/billing/id', (req, res) => billing.newId(storedKeyOf(req), res));
+app.get('/api/billing/plan', (req, res) => {
+  const holder = storedKeyOf(req);
+  return billing.planOf(holder, holder ? recordsHeldBy.get(holder).n : 0, res);
+});
 
 /**
  * Registry operations, as distinct from holder operations.
@@ -1179,6 +1204,7 @@ app.put('/api/records', (req, res) => {
   const holder = storedKeyOf(req);
   if (!holder) return res.status(401).json({ error: 'holder key required' });
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'expected an array' });
+  const cap = billing.recordCapFor(holder);
   if (req.body.length > MAX_PER_REQUEST) {
     return res.status(413).json({ error: `at most ${MAX_PER_REQUEST} records per request` });
   }
@@ -1192,9 +1218,7 @@ app.put('/api/records', (req, res) => {
   const fresh = new Set(
     req.body.filter((r) => r && typeof r.id === 'string' && !isMine.get(r.id, holder)).map((r) => r.id),
   ).size;
-  if (held + fresh > MAX_PER_HOLDER) {
-    return res.status(413).json({ error: `a holder may keep at most ${MAX_PER_HOLDER} records here` });
-  }
+  if (held + fresh > cap) return res.status(413).json(capRefusal(cap));
 
   // first_seen is when the registry first saw THIS content. Keeping it across an update
   // that changed the commitment let a holder store a placeholder, swap in different
@@ -1385,7 +1409,7 @@ app.put('/api/records', (req, res) => {
       plan.set(item.id, { item, body: JSON.stringify(toStore), prior, rev });
     }
     const freshNow = [...plan.keys()].filter((id) => !isMine.get(id, holder)).length;
-    if (heldNow.get(holder).n + freshNow > MAX_PER_HOLDER) return 'count';
+    if (heldNow.get(holder).n + freshNow > cap) return 'count';
     const before = heldBytes.get(holder).n;
     let after = before;
     for (const [id, { body, prior }] of plan) {
@@ -1496,9 +1520,7 @@ app.put('/api/records', (req, res) => {
     return 'ok';
   });
   const outcome = tx(shaped);
-  if (outcome === 'count') {
-    return res.status(413).json({ error: `a holder may keep at most ${MAX_PER_HOLDER} records here` });
-  }
+  if (outcome === 'count') return res.status(413).json(capRefusal(cap));
   if (outcome === 'bytes') {
     return res.status(413).json({
       error: `a holder may keep at most ${megabytes(HOLDER_MAX_BYTES)} of records here; this save would make it ${megabytes(projectedBytes)}. Nothing was changed.`,
@@ -1553,6 +1575,7 @@ const putDating = db.prepare(
 app.put('/api/records/dating', (req, res) => {
   const holder = storedKeyOf(req);
   if (!holder) return res.status(401).json({ error: 'holder key required' });
+  const cap = billing.recordCapFor(holder);
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'expected an array of { id, recordFingerprint, keyBinding? }' });
   if (req.body.length > DATING_MAX_PER_REQUEST) {
     return res.status(413).json({ error: `at most ${DATING_MAX_PER_REQUEST} dating rows per request` });
@@ -1594,8 +1617,9 @@ app.put('/api/records/dating', (req, res) => {
         rejected.push({ id: item.id, reason: 'this fingerprint is already registered by another holder' });
         continue;
       }
-      if (held + 1 > MAX_PER_HOLDER) {
-        rejected.push({ id: item.id, reason: `a holder may keep at most ${MAX_PER_HOLDER} records here` });
+      if (held + 1 > cap) {
+        const r = capRefusal(cap);
+        rejected.push({ id: item.id, reason: r.error, ...(r.code ? { code: r.code } : {}) });
         continue;
       }
       const t = now();

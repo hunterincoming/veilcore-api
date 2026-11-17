@@ -46,6 +46,10 @@ deployed.
 | `WRITE_BYTES_PER_DAY` | `209715200` (200 MB) | Daily write allowance per client address. |
 | `WHOLE_SET_READ_BYTES_PER_MINUTE` | `67108864` (64 MB) | Most an address may be sent by unpaged `GET /api/records` / `/api/licenses` in a minute. |
 | `HOLDER_MAX_BYTES` | `41943040` (40 MB) | Most a holder may keep in records, and separately in licences. A save that would grow the set past it is refused (413); one that does not grow it always works. |
+| `BILLING` | unset (off) | `on` switches on paid plans (see "Paid plans"). Off, nothing changes: billing routes answer 404 and every holder keeps up to 10,000 records. |
+| `BILLING_PADDLE_WEBHOOK_SECRET` | unset | The secret of Paddle's notification destination. Set it in Railway only. Missing, billing stays off and the deploy log says why. |
+| `BILLING_FREE_RECORDS` | unset | How many records a holder without a paid plan may keep. |
+| `BILLING_PADDLE_PRICES` | unset | Which Paddle prices are which plan: `pri_…=breeder,pri_…=lab`. A price not listed grants nothing. |
 | `PUBLIC_BASE` | `https://veilcore-api-production.up.railway.app` | Public URL, used by the embed and `/.well-known/veilcore-registry`. |
 | `VEILCORE_ANCHOR_CHAIN` | `midnight` | Chain batch roots are anchored on. |
 | `VEILCORE_ANCHOR_NETWORK` | unset | Network of the anchoring contract: `preview`, `preprod` or `mainnet`. Set together with the next one, or no anchor is recorded. |
@@ -1643,6 +1647,35 @@ ciphertext: no account, no email, no passkey public key.
 
 Limits per client (an IPv6 client by its /48): 20 new copies and 300 saves a UTC day. No
 total cap (the operator watches the database's size). /health lists `passkey-vault-v1`.
+
+## Paid plans (billing.js, switched off by default)
+
+Paddle sells the plans, as merchant of record: it holds the buyer's name, email, address and
+card, and handles sales tax. This registry keeps none of those.
+
+- **No account.** A plan belongs to a holder key, like records. Paddle never sees the key: the
+  browser asks `POST /api/billing/id` (holder key) for a billing id, 32 random bytes that mean
+  nothing outside this registry, and passes it to Paddle's checkout as
+  `customData.veilcoreBillingId`. The last 20 ids a holder was given keep working.
+- **Webhook.** `POST /api/billing/paddle`, raw body. Counted only with a valid
+  `Paddle-Signature` (`ts=…;h1=…`, HMAC-SHA256 of `ts:body` with the destination's secret, any
+  `h1` during a rotation), a timestamp within 5 minutes, and an event id not seen in 30 days.
+  `subscription.*` events set the holder's plan from the price id (`BILLING_PADDLE_PRICES`),
+  never from a name in the payload. An older event than the one applied changes nothing.
+  Events that can't be matched (an unknown billing id or price) are acknowledged and logged by
+  subscription id only.
+- **The ceiling.** A paid plan keeps up to 10,000 records, while `active` or `trialing`, and
+  while `past_due`, `paused` or `canceled` until its period ends plus 7 days. Otherwise
+  `BILLING_FREE_RECORDS`. A save or dating row past it is refused with `code: "plan-limit"`.
+  Nothing already held is touched, and records keep verifying.
+- **Switching on.** Holders over the free number that day keep what they hold and may add the
+  free number again, for good (done once, at the first start with billing on).
+- **Not counted.** Receiving a delivery (a lab or grower can always take what was sent), and
+  licences.
+- `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordCap }`.
+
+Stored: billing id digests, holder digest, plan, status, period end, Paddle subscription id,
+event ids for 30 days. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
 
 ## Other limits worth knowing (round D, 4 Oct 2026)
 
