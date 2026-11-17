@@ -160,6 +160,7 @@ test('free: three records, then the save and the dating route both refuse, sayin
     periodEnd: null,
     recordsHeld: 3,
     recordsCounted: 3,
+    recordsReserved: 0,
     recordCap: 3,
     plans: ['breeder', 'lab'],
   });
@@ -502,7 +503,7 @@ test('billing ids are kept at least seven days, whatever the number', async () =
   assert.equal(count(), 20);
 });
 
-test('received deliveries: the stub counts for nothing, the content the recipient seals does', () => {
+test('received deliveries: a stub holds a slot until sealed, the content the recipient seals counts', () => {
   const db = new Database(':memory:');
   db.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT NOT NULL, body TEXT)');
   const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
@@ -513,14 +514,18 @@ test('received deliveries: the stub counts for nothing, the content the recipien
   add.run('got-0', 'h1:a', JSON.stringify({ receivedFrom: 'VEIL-9', recordFingerprint: 'fp-got-0' }));
   const b = createBilling(db, { env, hardCap: 10_000 });
   assert.equal(b.recordCapFor('h1:a'), 3);
-  assert.equal(b.planRoom('h1:a').room, 1);
+  // Two dated, three stubs each holding a slot: two over (claims made before plans were on).
+  assert.deepEqual([b.planRoom('h1:a').room, b.planRoom('h1:a').reserved], [-2, 3]);
   b.noteAdded('h1:a', ['fp-own-1']);
-  assert.equal(b.planRoom('h1:a').room, 0);
+  assert.equal(b.planRoom('h1:a').room, -3);
   // Deleting a record doesn't give its slot back; its proof code dated again doesn't count twice.
   db.prepare("DELETE FROM records WHERE id = 'own-0'").run();
-  assert.equal(b.planRoom('h1:a').room, 0);
+  assert.equal(b.planRoom('h1:a').room, -3);
   b.noteAdded('h1:a', ['fp-own-0']);
-  assert.equal(b.planRoom('h1:a').room, 0);
+  assert.equal(b.planRoom('h1:a').room, -3);
+  // A stub deleted gives its slot back (it was never dated).
+  db.prepare("DELETE FROM records WHERE id = 'stub-0'").run();
+  assert.equal(b.planRoom('h1:a').room, -2);
   assert.equal(b.wasCounted('h1:a', 'fp-own-0'), true);
 });
 
@@ -588,7 +593,7 @@ test('a plan and its counts follow the holder key when its stored form moves', (
     "INSERT INTO billing_plans (subscription_id, holder_key, plan, status, occurred_at, updated_at) VALUES ('sub_01moved0000000001', ?, 'breeder', 'active', 1, 1)",
   ).run(old);
   db.prepare('INSERT INTO billing_grandfathered VALUES (?, 9)').run(old);
-  db.prepare("INSERT INTO billing_counted VALUES (?, 'c1')").run(old);
+  db.prepare("INSERT INTO billing_counted (holder_key, id_digest) VALUES (?, 'c1')").run(old);
   db.prepare("INSERT INTO billing_free_corrections VALUES (?, 't1')").run(old);
   db.prepare("INSERT INTO billing_ids VALUES ('d1', ?, 1)").run(old);
   adoptPlaintextKey(db, upper);
@@ -663,4 +668,66 @@ test('a delivery: claiming needs free room, and the content the recipient seals 
   const fix = correctionOf({ id: stubId });
   const r = await saveAll(recipient, [fix]);
   assert.deepEqual(r.json.rejected?.map((x) => x.code), ['plan-limit'], JSON.stringify(r.json));
+});
+
+test('a correction is free only as it first arrives: a held record turned into one, or one given new content, counts', async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  // A held record re-saved as a "correction" of another with new content: a new date, refused.
+  const turned = { ...kept[1], recordFingerprint: hex(), supersedes: correctionOf(kept[0]).supersedes };
+  const r = await saveAll(holder, [turned]);
+  assert.deepEqual(r.json.rejected?.map((x) => [x.id, x.code]), [[kept[1].id, 'plan-limit']], JSON.stringify(r.json));
+  // The real first correction is free.
+  const fix = correctionOf(kept[0]);
+  assert.equal((await saveAll(holder, [{ ...kept[0], supersededBy: fix.id }, fix])).json.ok, true);
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+  // Its content changed again and again: each is a new date, refused at the free number.
+  for (let i = 0; i < 3; i++) {
+    const edited = await saveAll(holder, [{ ...fix, recordFingerprint: hex() }]);
+    assert.deepEqual(edited.json.rejected?.map((x) => x.code), ['plan-limit'], JSON.stringify(edited.json));
+  }
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+});
+
+test('a free correction restored after a delete is not new', async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  const fix = correctionOf(kept[0]);
+  assert.equal((await saveAll(holder, [{ ...kept[0], supersededBy: fix.id }, fix])).json.ok, true);
+  assert.equal((await call('DELETE', '/api/records', holder, { ids: [fix.id] })).status, 200);
+  // The same correction again (a backup): its proof code was kept as free, so it isn't refused.
+  const back = await saveAll(holder, [fix]);
+  assert.equal(back.json.rejected, undefined, JSON.stringify(back.json));
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+});
+
+test('a claimed stub holds a slot until sealed: one slot left takes one claim, and sealing it fits', async () => {
+  const sender = hex();
+  const src = newRecord();
+  assert.equal((await saveAll(sender, [src])).json.ok, true);
+  const offer = async () => {
+    const sealedOffer = sealOfferForTest(offerFromRecord(src), randomBytes(32), src.id, src.recordFingerprint);
+    const o = await call('POST', '/transfers', sender, { sourceRecord: src.id, toHandle: handleTagFor(hex(), 'lab@x'), sealedOffer });
+    assert.equal(o.status, 200, JSON.stringify(o.json));
+    return o.json;
+  };
+  const recipient = hex();
+  assert.equal((await saveAll(recipient, [newRecord(), newRecord()])).json.ok, true);
+  const o1 = await offer();
+  const o2 = await offer();
+  const c1 = await call('POST', `/transfers/${o1.transferId}/claim`, recipient, { claimCode: o1.claimCode });
+  assert.equal(c1.status, 200, JSON.stringify(c1.json));
+  assert.equal((await plan(recipient)).json.recordsReserved, 1);
+  // The last slot is held by the stub: a second claim, and a new record, are refused.
+  const c2 = await call('POST', `/transfers/${o2.transferId}/claim`, recipient, { claimCode: o2.claimCode });
+  assert.equal(c2.status, 413, JSON.stringify(c2.json));
+  assert.equal((await save(recipient)).json.rejected?.[0]?.code, 'plan-limit');
+  // Sealing the stub uses its own slot.
+  const stubId = c1.json.recordId ?? c1.json.receivedRecordId ?? c1.json.id;
+  const sealed = await saveAll(recipient, [{ id: stubId, recordFingerprint: hex(), nonce: hex(), strainName: 'Got' }]);
+  assert.equal(sealed.json.ok, true, JSON.stringify(sealed.json));
+  const p = await plan(recipient);
+  assert.deepEqual([p.json.recordsCounted, p.json.recordsReserved], [3, 0]);
 });

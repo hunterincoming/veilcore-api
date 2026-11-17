@@ -1691,12 +1691,16 @@ card, and handles sales tax. This registry keeps none of those.
   every proof code they hold that counts is counted.
 - **Deliveries.** Claiming one needs free room (413 `plan-limit` otherwise): the recipient
   seals the received record with their own content, and that date counts. The claimed stub,
-  before it is sealed, counts for nothing.
-- **Not counted.** Licences, and a record's one correction (a correction of the holder's own
-  record that is neither a correction nor received, once per record, ever: a correction of a
-  correction, of a received record, or a correction deleted and made again, counts).
+  until it is sealed, holds one slot (`recordsReserved`), so claims can't take more than the
+  plan can date; sealing it uses that slot, and deleting it gives the slot back.
+- **Not counted.** Licences, and a record's one correction as it first arrives (a new id, or one
+  dated first as a bare proof code, correcting the holder's own record that is neither a
+  correction nor received, once per record, ever). A held record turned into a correction, a
+  free correction given new content, a correction of a correction or of a received record, or
+  a correction deleted and made again, counts. The free correction's proof code is kept (marked
+  free), so the same correction restored after a delete isn't new.
 - `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordsCounted,
-  recordCap, plans }`.
+  recordsReserved, recordCap, plans }`.
 - The billing tables follow a holder key when its stored form moves (`holder-key.js`).
 
 Stored: billing id digests, holder digest, plan, status, period end, Paddle subscription id,

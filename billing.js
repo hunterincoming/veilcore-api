@@ -207,6 +207,11 @@ const createBilling = (
   const config = billingConfig(env, hardCap);
   if (!config.enabled && (env.BILLING ?? '') !== '') console.error(`billing stays off: ${config.reason}`);
 
+  // A free correction's proof code is kept too (free = 1), so restoring it after a delete isn't new;
+  // it doesn't count against the plan. Added in place on a database from before.
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('billing_counted') WHERE name = 'free'").get()) {
+    db.exec('ALTER TABLE billing_counted ADD COLUMN free INTEGER NOT NULL DEFAULT 0');
+  }
   // Added before paid_through existed (a sandbox database): the column is added in place.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('billing_plans') WHERE name = 'paid_through'").get()) {
     db.exec('ALTER TABLE billing_plans ADD COLUMN paid_through INTEGER');
@@ -249,10 +254,16 @@ const createBilling = (
         `INSERT INTO billing_free_corrections (holder_key, target_digest) SELECT ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM billing_free_corrections WHERE holder_key = ? AND target_digest = ?)`,
       );
-      for (const r of db.prepare(`SELECT r.holder_key, json_extract(r.body, '$.supersedes.recordId') AS target
+      const freeFp = db.prepare(
+        `INSERT INTO billing_counted (holder_key, id_digest, free) SELECT ?, ?, 1
+         WHERE NOT EXISTS (SELECT 1 FROM billing_counted WHERE holder_key = ? AND id_digest = ? AND free = 1)`,
+      );
+      for (const r of db.prepare(`SELECT r.holder_key, json_extract(r.body, '$.supersedes.recordId') AS target,
+                                  json_extract(r.body, '$.recordFingerprint') AS fp
                                   FROM records r WHERE ${FREE_CORRECTION}`).all()) {
         const d = idDigest(r.target);
         used.run(r.holder_key, d, r.holder_key, d);
+        if (typeof r.fp === 'string' && r.fp) freeFp.run(r.holder_key, fpDigest(r.fp), r.holder_key, fpDigest(r.fp));
       }
     })();
   }
@@ -264,7 +275,17 @@ const createBilling = (
     'SELECT plan, status, period_end, past_due_since, paid_through FROM billing_plans WHERE holder_key = ?',
   );
   const grandfatheredOf = db.prepare('SELECT MAX(cap) AS cap FROM billing_grandfathered WHERE holder_key = ?');
-  const countedOf = db.prepare('SELECT COUNT(DISTINCT id_digest) AS n FROM billing_counted WHERE holder_key = ?');
+  const countedOf = db.prepare(
+    `SELECT COUNT(DISTINCT id_digest) AS n FROM billing_counted c WHERE holder_key = ? AND free = 0
+       AND NOT EXISTS (SELECT 1 FROM billing_counted f WHERE f.holder_key = c.holder_key AND f.id_digest = c.id_digest AND f.free = 1)`,
+  );
+  // A received record not sealed yet (a claim's stub: no proof code) holds one slot until its
+  // holder seals it, so claims can't take more than the free plan can ever date.
+  const stubsOf = db.prepare(
+    `SELECT COUNT(*) AS n FROM records WHERE holder_key = ?
+       AND json_extract(body, '$.receivedFrom') IS NOT NULL AND json_extract(body, '$.recordFingerprint') IS NULL`,
+  );
+  const addFree = db.prepare('INSERT INTO billing_counted (holder_key, id_digest, free) VALUES (?, ?, 1)');
   const isCounted = db.prepare('SELECT 1 FROM billing_counted WHERE holder_key = ? AND id_digest = ? LIMIT 1');
   const addCounted = db.prepare('INSERT INTO billing_counted (holder_key, id_digest) VALUES (?, ?)');
   const dropCounted = db.prepare('DELETE FROM billing_counted WHERE holder_key = ? AND id_digest = ?');
@@ -309,9 +330,11 @@ const createBilling = (
    * Returns { room, cap } so a refusal can say which ceiling it was.
    */
   const planRoom = (holder) => {
-    if (!config.enabled || currentPlan(holder)) return { room: Infinity, cap: hardCap };
+    if (!config.enabled || currentPlan(holder)) return { room: Infinity, cap: hardCap, reserved: 0 };
     const cap = recordCapFor(holder);
-    return { room: Math.max(0, cap - usedOf(holder)), cap };
+    const reserved = stubsOf.get(holder).n;
+    // Not clamped: a save that seals a stub gives its reserved slot back before using it.
+    return { room: cap - usedOf(holder) - reserved, cap, reserved };
   };
 
   /** Whether this proof code already counted for this holder (dated before, maybe deleted since). */
@@ -325,9 +348,18 @@ const createBilling = (
 
   /** Whether this record's one free correction is still to be used. Off: always (nothing counts). */
   const correctionIsFree = (holder, target) => !config.enabled || !freeUsed.get(holder, idDigest(target));
-  /** The free correction of this record was used (call inside the transaction that stored it). */
-  const noteFreeCorrection = (holder, target) => {
-    if (config.enabled && correctionIsFree(holder, target)) addFreeUsed.run(holder, idDigest(target));
+  /**
+   * The free correction of this record was used, with this proof code (call inside the
+   * transaction that stored it). The proof code is kept, marked free, so the same correction
+   * restored after a delete isn't new.
+   */
+  const noteFreeCorrection = (holder, target, fp) => {
+    if (!config.enabled) return;
+    if (correctionIsFree(holder, target)) addFreeUsed.run(holder, idDigest(target));
+    if (typeof fp === 'string' && fp) {
+      dropCounted.run(holder, fpDigest(fp));
+      addFree.run(holder, fpDigest(fp));
+    }
   };
 
   /** A proof code counted when only it was dated, now stored as a free correction. */
@@ -526,6 +558,8 @@ const createBilling = (
       recordsHeld,
       // What counts against the free plan: proof codes dated, records deleted or not (usedOf).
       recordsCounted: p ? recordsHeld : usedOf(holder),
+      // Received records not sealed yet: each holds a slot on the free plan until sealed.
+      recordsReserved: p ? 0 : stubsOf.get(holder).n,
       recordCap: recordCapFor(holder),
       plans: [...config.priceOfPlan.keys()],
     });

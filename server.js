@@ -1304,6 +1304,8 @@ app.put('/api/records', (req, res) => {
   //     Equal is allowed: an unchanged row is re-sent with the same rev.
   const notWritten = [];
   const storedBody = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
+  // A received record's stub (a claim wrote it; the recipient hasn't sealed it yet).
+  const isReceivedStub = (b) => typeof b?.receivedFrom === 'string' && !b.recordFingerprint;
   const heldCorrection = db.prepare(
     `SELECT id, body FROM records WHERE holder_key = ? AND ${CORRECTED} = ? AND correction_conflict IS NULL`,
   );
@@ -1438,7 +1440,11 @@ app.put('/api/records', (req, res) => {
     const freeTargets = new Map(); // free correction id -> the record it corrects
     for (const [id, r] of plan) {
       const t = bodyTarget(r.body);
-      if (t !== undefined && t !== id && isPlainRecord(t) && billing.correctionIsFree(holder, t)) {
+      // Free only as it first arrives: a new id, or one dated first as a bare proof code. A held
+      // record turned into a correction, or a free correction given new content, dates a new
+      // version and counts like any other.
+      const arriving = !r.prior || isDatingOnlyBody(JSON.parse(r.prior.body));
+      if (arriving && t !== undefined && t !== id && isPlainRecord(t) && billing.correctionIsFree(holder, t)) {
         freeCorrections.add(id);
         freeTargets.set(id, t);
       }
@@ -1457,6 +1463,8 @@ app.put('/api/records', (req, res) => {
       const changed = fp !== undefined && (!mine || !r.prior || fp !== fpOf(r.prior.body));
       const counts =
         changed && !freeCorrections.has(id) && !countingFps.has(fp) && !billing.wasCounted(holder, fp);
+      // Sealing a received record's stub uses the slot the claim reserved for it.
+      if (counts && mine && r.prior && isReceivedStub(JSON.parse(r.prior.body))) room.room++;
       const cap = !mine && hardRoom <= 0 ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
       if (cap) {
         plan.delete(id);
@@ -1558,8 +1566,7 @@ app.put('/api/records', (req, res) => {
             if (!r.prior) inserted.push(r.item.id);
             // Dated first as a bare proof code (counted then), now stored as a free correction.
             else if (freeCorrections.has(r.item.id) && isDatingOnlyBody(JSON.parse(r.prior.body))) {
-              billing.uncount(holder, fpOf(r.prior.body));
-              billing.noteFreeCorrection(holder, freeTargets.get(r.item.id));
+              billing.noteFreeCorrection(holder, freeTargets.get(r.item.id), fpOf(r.body));
             }
             const fp = fpOf(r.body);
             if (fp !== undefined && countingFps.has(fp)) writtenFps.push(fp);
@@ -1581,7 +1588,9 @@ app.put('/api/records', (req, res) => {
       }
       for (const { id, supersededBy } of relinks) relink.run(supersededBy, now(), id, holder);
       billing.noteAdded(holder, writtenFps);
-      for (const id of inserted) if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id));
+      for (const id of inserted) {
+        if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id), fpOf(plan.get(id).body));
+      }
     });
     for (;;) {
       try {
