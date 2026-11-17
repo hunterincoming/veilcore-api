@@ -576,9 +576,9 @@ const storedKeyOf = (req) => {
   return raw ? storedHolderKey(raw) : '';
 };
 
-// Paid plans (billing.js): a billing id to hand Paddle's checkout, and the holder's plan.
+// Paid plans (billing.js): open a checkout on Paddle's own page, and read the holder's plan.
 const recordsHeldBy = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?');
-app.post('/api/billing/id', (req, res) => billing.newId(storedKeyOf(req), res));
+app.post('/api/billing/checkout', (req, res) => billing.checkout(storedKeyOf(req), req.body, res));
 app.get('/api/billing/plan', (req, res) => {
   const holder = storedKeyOf(req);
   return billing.planOf(holder, holder ? recordsHeldBy.get(holder).n : 0, res);

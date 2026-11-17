@@ -5,9 +5,14 @@
 //   - a plan belongs to a holder key, as records do; there is no account or password;
 //   - stopping payment never breaks a record: only adding records past the free number stops;
 //   - the registry keeps no name, email, address, card or amount (Paddle holds those);
-//   - Paddle never sees a holder key. It sees a billing id: 32 random bytes the registry
-//     hands the holder, meaningless outside this registry. A holder key is the holder's only
-//     credential (x-holder-key), so handing one to a payment company would let it act as them.
+//   - Paddle never sees a holder key. It sees a billing id: 32 random bytes the registry puts
+//     on the checkout itself, meaningless outside this registry, and never shown to anyone.
+//     A holder key is the holder's only credential (x-holder-key), so handing one to a
+//     payment company would let it act as them;
+//   - no Paddle code runs on VeilCore's site. The registry opens the checkout with Paddle's
+//     API (POST /transactions, the billing id in custom_data) and the site sends the holder
+//     to Paddle's own hosted checkout page with that transaction. The page that holds a
+//     holder's keys never loads a payment company's script.
 //
 // Off, recordCapFor returns the same ceiling for everyone that the registry has always had,
 // and every billing route answers 404, so a deploy with this file changes nothing.
@@ -43,6 +48,12 @@ const BILLING_ID = /^[0-9a-f]{64}$/;
 /** Billing ids kept per holder; older ones stop working. */
 const BILLING_IDS_KEPT = 20;
 const PADDLE_ID = /^[a-z]{2,4}_[0-9a-z]{10,64}$/;
+/** Paddle's two API hosts. A sandbox key works only on the sandbox one, and the reverse. */
+const PADDLE_API = { sandbox: 'https://sandbox-api.paddle.com', live: 'https://api.paddle.com' };
+/** A hosted checkout link: https://…paddle.io/checkout/hsc_… (set up in Paddle's dashboard). */
+const HOSTED_CHECKOUT = /^https:\/\/([a-z-]+\.)?paddle\.io\/checkout\/hsc_[0-9a-z]{10,64}$/;
+/** Checkouts one holder may open in an hour: each one is a transaction in Paddle. */
+const CHECKOUTS_PER_HOUR = 10;
 
 const digest = (s) => createHash('sha256').update(`veilcore:billing-id:v1:${s}`).digest('hex');
 
@@ -67,7 +78,24 @@ const billingConfig = (env, hardCap) => {
     prices.set(price, plan);
   }
   if (!prices.size) return { enabled: false, reason: 'BILLING_PADDLE_PRICES is empty' };
-  return { enabled: true, secret, free, prices };
+  if (new Set(prices.values()).size !== prices.size) {
+    return { enabled: false, reason: 'BILLING_PADDLE_PRICES names a plan twice' };
+  }
+  const api = env.BILLING_PADDLE_API ?? '';
+  if (!Object.values(PADDLE_API).includes(api)) {
+    return { enabled: false, reason: `BILLING_PADDLE_API must be ${PADDLE_API.sandbox} or ${PADDLE_API.live}` };
+  }
+  const apiKey = env.BILLING_PADDLE_API_KEY ?? '';
+  if (apiKey.length < 20) return { enabled: false, reason: 'BILLING_PADDLE_API_KEY is missing' };
+  if ((api === PADDLE_API.sandbox) !== apiKey.includes('_sdbx')) {
+    return { enabled: false, reason: 'BILLING_PADDLE_API_KEY and BILLING_PADDLE_API are not both sandbox or both live' };
+  }
+  const checkout = env.BILLING_PADDLE_CHECKOUT ?? '';
+  if (!HOSTED_CHECKOUT.test(checkout)) {
+    return { enabled: false, reason: 'BILLING_PADDLE_CHECKOUT must be a hosted checkout link (https://…paddle.io/checkout/hsc_…)' };
+  }
+  const priceOfPlan = new Map([...prices].map(([price, plan]) => [plan, price]));
+  return { enabled: true, secret, free, prices, priceOfPlan, api, apiKey, checkout };
 };
 
 /**
@@ -101,7 +129,10 @@ const signatureOk = (header, raw, secret, now) => {
  * @param opts.hardCap the registry's ceiling for everyone (MAX_PER_HOLDER)
  * @param opts.now clock, for tests
  */
-const createBilling = (db, { env = process.env, hardCap, now = () => Date.now() } = {}) => {
+const createBilling = (
+  db,
+  { env = process.env, hardCap, now = () => Date.now(), fetchImpl = (...a) => globalThis.fetch(...a) } = {},
+) => {
   db.exec(`
     CREATE TABLE IF NOT EXISTS billing_ids (
       id_digest TEXT PRIMARY KEY,
@@ -283,11 +314,40 @@ const createBilling = (db, { env = process.env, hardCap, now = () => Date.now() 
     return res.status(r.status).json(r.body);
   };
 
-  /** POST /api/billing/id, for the holder in `holder` (the stored key). */
-  const newId = (holder, res) => {
+  const checkoutsBy = new Map();
+  /**
+   * POST /api/billing/checkout { plan }, for the holder in `holder` (the stored key). Opens a
+   * transaction in Paddle carrying a new billing id, and answers the hosted checkout link for
+   * it. The billing id never leaves the registry except to Paddle.
+   */
+  const checkout = async (holder, body, res) => {
     if (!config.enabled) return off(res);
     if (!holder) return res.status(401).json({ error: 'holder key required' });
-    return res.json({ billingId: issueId(holder) });
+    const price = config.priceOfPlan.get(body?.plan);
+    if (!price) return res.status(400).json({ error: 'no such plan' });
+    const hour = Math.floor(now() / 3_600_000);
+    const used = checkoutsBy.get(holder);
+    const count = used && used.hour === hour ? used.n + 1 : 1;
+    if (checkoutsBy.size > 10_000) checkoutsBy.clear();
+    checkoutsBy.set(holder, { hour, n: count });
+    if (count > CHECKOUTS_PER_HOUR) return res.status(429).json({ error: 'too many checkouts opened; try again in an hour' });
+    const billingId = issueId(holder);
+    let txn;
+    try {
+      const r = await fetchImpl(`${config.api}/transactions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${config.apiKey}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ items: [{ price_id: price, quantity: 1 }], custom_data: { veilcoreBillingId: billingId } }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const j = await r.json().catch(() => ({}));
+      txn = r.ok && typeof j?.data?.id === 'string' && PADDLE_ID.test(j.data.id) ? j.data.id : '';
+      if (!txn) console.warn(`billing: Paddle refused a checkout (HTTP ${r.status})`);
+    } catch (e) {
+      console.warn(`billing: Paddle unreachable for a checkout (${e?.name ?? 'error'})`);
+    }
+    if (!txn) return res.status(502).json({ error: 'the payment provider could not open a checkout; try again shortly' });
+    return res.json({ url: `${config.checkout}?transaction_id=${encodeURIComponent(txn)}` });
   };
 
   /** GET /api/billing/plan, for the holder in `holder` (the stored key). */
@@ -304,7 +364,7 @@ const createBilling = (db, { env = process.env, hardCap, now = () => Date.now() 
     });
   };
 
-  return { enabled: config.enabled, recordCapFor, webhook, newId, planOf };
+  return { enabled: config.enabled, plans: config.enabled ? [...config.priceOfPlan.keys()] : [], recordCapFor, webhook, checkout, planOf };
 };
 
 module.exports = { createBilling, signatureOk, billingConfig, GRACE_MS, SIGNATURE_TOLERANCE_MS };

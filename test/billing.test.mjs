@@ -32,6 +32,32 @@ process.env.BILLING = 'on';
 process.env.BILLING_PADDLE_WEBHOOK_SECRET = SECRET;
 process.env.BILLING_FREE_RECORDS = '3';
 process.env.BILLING_PADDLE_PRICES = `${BREEDER}=breeder, ${LAB}=lab`;
+process.env.BILLING_PADDLE_API = 'https://sandbox-api.paddle.com';
+process.env.BILLING_PADDLE_API_KEY = 'pdl_sdbx_apikey_test_0123456789abcdef';
+process.env.BILLING_PADDLE_CHECKOUT = 'https://sandbox-pay.paddle.io/checkout/hsc_01testcheckout000001';
+const env = {
+  BILLING: 'on',
+  BILLING_PADDLE_WEBHOOK_SECRET: SECRET,
+  BILLING_FREE_RECORDS: '3',
+  BILLING_PADDLE_PRICES: `${BREEDER}=breeder`,
+  BILLING_PADDLE_API: process.env.BILLING_PADDLE_API,
+  BILLING_PADDLE_API_KEY: process.env.BILLING_PADDLE_API_KEY,
+  BILLING_PADDLE_CHECKOUT: process.env.BILLING_PADDLE_CHECKOUT,
+};
+
+// Paddle's API, stood in for: every transaction the registry opens is kept, with its body and
+// headers, so a test can read the billing id it carried (as Paddle would) and check what was sent.
+const opened = [];
+let paddleAnswer = null;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  if (String(url).startsWith('https://sandbox-api.paddle.com/')) {
+    opened.push({ url: String(url), headers: init.headers, body: JSON.parse(init.body) });
+    if (paddleAnswer) return paddleAnswer();
+    return new Response(JSON.stringify({ data: { id: `txn_01${randomBytes(10).toString('hex')}` } }), { status: 201 });
+  }
+  return realFetch(url, init);
+};
 const require = createRequire(import.meta.url);
 const { app } = require('../server.js');
 const { createBilling, GRACE_MS } = require('../billing.js');
@@ -63,7 +89,13 @@ const date = (holder, n) => call('PUT', '/api/records/dating', holder, Array.fro
 // testBody seals each record as the browser does, with the holder's vault key.
 const save = (holder) => call('PUT', '/api/records', holder, [{ id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'S' }]);
 const plan = (holder) => call('GET', '/api/billing/plan', holder);
-const billingId = async (holder) => (await call('POST', '/api/billing/id', holder)).json.billingId;
+const checkout = (holder, planName = 'breeder') => call('POST', '/api/billing/checkout', holder, { plan: planName });
+/** Open a checkout as the holder would, and read the billing id it carried, as Paddle would. */
+const billingId = async (holder) => {
+  const r = await checkout(holder);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  return opened.at(-1).body.custom_data.veilcoreBillingId;
+};
 
 let n = 0;
 const event = (type, { billingId: bid, sub, status = 'active', price = BREEDER, endsAt, occurredAt } = {}) => ({
@@ -105,18 +137,49 @@ test('free: three records, then the save and the dating route both refuse, sayin
   assert.deepEqual(p.json, { plan: 'free', status: null, periodEnd: null, recordsHeld: 3, recordCap: 3 });
 });
 
-test('a billing id is not the holder key, and is new each time; earlier ones still work', async () => {
+test('a checkout goes to Paddle with a billing id, never the holder key; earlier ids still work', async () => {
   const holder = hex();
-  const a = await billingId(holder);
-  const b = await billingId(holder);
+  const r = await checkout(holder, 'lab');
+  assert.equal(r.status, 200);
+  const sent = opened.at(-1);
+  assert.equal(sent.url, 'https://sandbox-api.paddle.com/transactions');
+  assert.equal(sent.headers.authorization, `Bearer ${process.env.BILLING_PADDLE_API_KEY}`);
+  assert.deepEqual(sent.body.items, [{ price_id: LAB, quantity: 1 }]);
+  const a = sent.body.custom_data.veilcoreBillingId;
   assert.match(a, /^[0-9a-f]{64}$/);
-  assert.notEqual(a, holder);
+  assert.ok(!JSON.stringify(sent).includes(holder), 'the holder key is not sent to Paddle');
+  // The holder is sent to Paddle's own hosted page, for that transaction. No billing id in it.
+  assert.match(r.json.url, /^https:\/\/sandbox-pay\.paddle\.io\/checkout\/hsc_01testcheckout000001\?transaction_id=txn_01[0-9a-f]{20}$/);
+  assert.ok(!r.json.url.includes(a));
+  // A second checkout (another tab) gets a new id; a payment through the first still lands.
+  const b = await billingId(holder);
   assert.notEqual(a, b);
-  assert.equal((await call('POST', '/api/billing/id')).status, 401);
-  // A checkout opened with the first id lands after the second was asked for.
-  const r = await send(event('subscription.created', { billingId: a, sub: subId() }));
-  assert.deepEqual(r.json, { ok: true });
-  assert.equal((await plan(holder)).json.plan, 'breeder');
+  const paid = await send(event('subscription.created', { billingId: a, sub: subId(), price: LAB }));
+  assert.deepEqual(paid.json, { ok: true });
+  assert.equal((await plan(holder)).json.plan, 'lab');
+  // No holder key, an unknown plan: refused before Paddle is asked.
+  const before = opened.length;
+  assert.equal((await call('POST', '/api/billing/checkout', undefined, { plan: 'breeder' })).status, 401);
+  assert.equal((await checkout(holder, 'gold')).status, 400);
+  assert.equal(opened.length, before);
+});
+
+test('Paddle refusing or unreachable: a plain 502, nothing stored as paid', async () => {
+  const holder = hex();
+  paddleAnswer = () => new Response(JSON.stringify({ error: { code: 'forbidden' } }), { status: 403 });
+  assert.equal((await checkout(holder)).status, 502);
+  paddleAnswer = () => { throw new TypeError('fetch failed'); };
+  assert.equal((await checkout(holder)).status, 502);
+  paddleAnswer = () => new Response(JSON.stringify({ data: { id: '<script>' } }), { status: 201 });
+  assert.equal((await checkout(holder)).status, 502);
+  paddleAnswer = null;
+  assert.equal((await plan(holder)).json.plan, 'free');
+});
+
+test('a holder may open ten checkouts an hour', async () => {
+  const holder = hex();
+  for (let i = 0; i < 10; i++) assert.equal((await checkout(holder)).status, 200);
+  assert.equal((await checkout(holder)).status, 429);
 });
 
 test('a webhook counts only when signed over its exact bytes, fresh, and once', async () => {
@@ -195,7 +258,6 @@ test('switched on over existing holders: those above the free number keep theirs
   const add = db.prepare('INSERT INTO records (id, holder_key, body) VALUES (?, ?, ?)');
   for (let i = 0; i < 5; i++) add.run(`big-${i}`, 'h1:big', '{}');
   add.run('small-0', 'h1:small', '{}');
-  const env = { BILLING: 'on', BILLING_PADDLE_WEBHOOK_SECRET: SECRET, BILLING_FREE_RECORDS: '3', BILLING_PADDLE_PRICES: `${BREEDER}=breeder` };
   const b = createBilling(db, { env, hardCap: 10_000 });
   assert.equal(b.recordCapFor('h1:big'), 8);
   assert.equal(b.recordCapFor('h1:small'), 3);
@@ -206,5 +268,14 @@ test('switched on over existing holders: those above the free number keep theirs
   // Off, or half configured: everyone keeps the registry's ceiling, as before.
   assert.equal(createBilling(db, { env: {}, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
   assert.equal(createBilling(db, { env: { ...env, BILLING_PADDLE_PRICES: '' }, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
-  assert.equal(createBilling(db, { env: { ...env, BILLING_PADDLE_WEBHOOK_SECRET: 'short' }, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
+  for (const wrong of [
+    { BILLING_PADDLE_WEBHOOK_SECRET: 'short' },
+    { BILLING_PADDLE_API: 'https://evil.example' },
+    { BILLING_PADDLE_API: 'https://api.paddle.com' }, // a sandbox key against the live API
+    { BILLING_PADDLE_API_KEY: '' },
+    { BILLING_PADDLE_CHECKOUT: 'https://evil.example/checkout/hsc_01testcheckout000001' },
+    { BILLING_PADDLE_PRICES: `${BREEDER}=breeder,${LAB}=breeder` },
+  ]) {
+    assert.equal(createBilling(db, { env: { ...env, ...wrong }, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000, JSON.stringify(wrong));
+  }
 });

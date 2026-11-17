@@ -37,7 +37,7 @@ const call = async (method, path, holder, body) => {
 
 test('off: billing routes answer 404 and a webhook is not read', async () => {
   const holder = hex();
-  assert.equal((await call('POST', '/api/billing/id', holder)).status, 404);
+  assert.equal((await call('POST', '/api/billing/checkout', holder, { plan: 'breeder' })).status, 404);
   assert.equal((await call('GET', '/api/billing/plan', holder)).status, 404);
   assert.equal((await call('POST', '/api/billing/paddle', undefined, { event_id: 'evt_01x', event_type: 'subscription.created' })).status, 404);
 });

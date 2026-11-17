@@ -50,6 +50,9 @@ deployed.
 | `BILLING_PADDLE_WEBHOOK_SECRET` | unset | The secret of Paddle's notification destination. Set it in Railway only. Missing, billing stays off and the deploy log says why. |
 | `BILLING_FREE_RECORDS` | unset | How many records a holder without a paid plan may keep. |
 | `BILLING_PADDLE_PRICES` | unset | Which Paddle prices are which plan: `pri_…=breeder,pri_…=lab`. A price not listed grants nothing. |
+| `BILLING_PADDLE_API` | unset | `https://sandbox-api.paddle.com` or `https://api.paddle.com`, matching the key. |
+| `BILLING_PADDLE_API_KEY` | unset | Paddle server API key, used only to open checkouts. Railway only. A sandbox key (`_sdbx`) works only with the sandbox API. |
+| `BILLING_PADDLE_CHECKOUT` | unset | The hosted checkout link from Paddle's dashboard (`https://…paddle.io/checkout/hsc_…`). Live accounts need Paddle's approval for hosted checkouts. |
 | `PUBLIC_BASE` | `https://veilcore-api-production.up.railway.app` | Public URL, used by the embed and `/.well-known/veilcore-registry`. |
 | `VEILCORE_ANCHOR_CHAIN` | `midnight` | Chain batch roots are anchored on. |
 | `VEILCORE_ANCHOR_NETWORK` | unset | Network of the anchoring contract: `preview`, `preprod` or `mainnet`. Set together with the next one, or no anchor is recorded. |
@@ -1653,10 +1656,14 @@ total cap (the operator watches the database's size). /health lists `passkey-vau
 Paddle sells the plans, as merchant of record: it holds the buyer's name, email, address and
 card, and handles sales tax. This registry keeps none of those.
 
-- **No account.** A plan belongs to a holder key, like records. Paddle never sees the key: the
-  browser asks `POST /api/billing/id` (holder key) for a billing id, 32 random bytes that mean
-  nothing outside this registry, and passes it to Paddle's checkout as
-  `customData.veilcoreBillingId`. The last 20 ids a holder was given keep working.
+- **No account.** A plan belongs to a holder key, like records. Paddle never sees the key.
+- **No Paddle code on the site.** `POST /api/billing/checkout { plan }` (holder key) makes a
+  billing id (32 random bytes that mean nothing outside this registry), opens a transaction
+  with Paddle's API carrying it as `custom_data.veilcoreBillingId`, and answers the hosted
+  checkout link for that transaction. The site sends the holder to Paddle's own page; the
+  page holding their keys never loads a payment company's script. The billing id is never
+  shown to anyone. The last 20 a holder was given keep working. Ten checkouts an hour per
+  holder. Paddle refusing or unreachable: 502.
 - **Webhook.** `POST /api/billing/paddle`, raw body. Counted only with a valid
   `Paddle-Signature` (`ts=…;h1=…`, HMAC-SHA256 of `ts:body` with the destination's secret, any
   `h1` during a rotation), a timestamp within 5 minutes, and an event id not seen in 30 days.
