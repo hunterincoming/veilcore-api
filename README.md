@@ -1678,26 +1678,35 @@ card, and handles sales tax. This registry keeps none of those.
 - **The ceiling.** A paid plan keeps up to 10,000 records, while `active` or `trialing`, while
   `paused` or `canceled` until its period ends plus 7 days, and while `past_due` for 7 days
   from the first failed renewal (cancelled after a failed renewal: to the end of the period
-  paid for, plus 7 days, never past 7 days from the failure). Otherwise `BILLING_FREE_RECORDS`,
-  counted per record id (`billing_counted`, digested): deleting one doesn't make room, and
-  saving a deleted id again doesn't count it twice. Only the new rows past a ceiling are
-  refused, each in `rejected` with `code: "plan-limit"`; the rest of the save is stored, so a
-  new record waiting in a browser never blocks edits. Nothing already held is touched, and
-  records keep verifying.
+  paid for, plus 7 days, never past 7 days from the failure). Otherwise `BILLING_FREE_RECORDS`
+  proof codes dated: the free plan limits dates made, not records kept. Counted per distinct
+  proof code (`billing_counted`, digested), never removed: deleting a record doesn't make room,
+  the same content saved again doesn't count twice, and new content under an old id counts like
+  a new record. Only the rows past a ceiling are refused, each in `rejected` with
+  `code: "plan-limit"`; the rest of the save is stored, so a new record waiting in a browser
+  never blocks an edit that keeps the content. Nothing already held is touched, and records
+  keep verifying.
 - **Switching on.** Each time billing goes from off to on: holders over the free number keep
-  what they hold and may add the free number again, for good (a cap is only raised), and
-  every record they hold that counts is counted.
-- **Not counted.** Receiving a delivery (a lab or grower can always take what was sent),
-  licences, and a record's one correction (a correction of a record that isn't itself a
-  correction, once per record, ever: a correction of a correction, or a correction deleted and
-  made again, counts).
+  what they hold and may date the free number again, for good (a cap is only raised), and
+  every proof code they hold that counts is counted.
+- **Deliveries.** Claiming one needs free room (413 `plan-limit` otherwise): the recipient
+  seals the received record with their own content, and that date counts. The claimed stub,
+  before it is sealed, counts for nothing.
+- **Not counted.** Licences, and a record's one correction (a correction of the holder's own
+  record that is neither a correction nor received, once per record, ever: a correction of a
+  correction, of a received record, or a correction deleted and made again, counts).
 - `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordsCounted,
   recordCap, plans }`.
 - The billing tables follow a holder key when its stored form moves (`holder-key.js`).
 
 Stored: billing id digests, holder digest, plan, status, period end, Paddle subscription id,
-digests of the record ids counted on the free plan and of the records whose free correction
-was used, event ids for 30 days. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
+digests of the proof codes counted on the free plan and of the records whose free correction
+was used, event ids for 30 days.
+
+**A change with billing off too:** at the registry's own ceiling (10,000 records), a save now
+refuses only its new rows (each in `rejected`, status 200) and stores the rest; it used to
+refuse the whole save with a 413. An id held by another holder no longer counts as new, since
+it is never written. Pinned in `test/billing-off.test.mjs`. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
 
 ## Other limits worth knowing (round D, 4 Oct 2026)
 

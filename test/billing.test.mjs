@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { untilReady, testBody } from './helpers.mjs';
+import { untilReady, testBody, handleTagFor, sealOfferForTest, offerFromRecord } from './helpers.mjs';
 
 const SECRET = 'pdl_ntfset_test_secret_0123456789';
 const BREEDER = 'pri_01testbreeder0001';
@@ -285,14 +285,15 @@ test('switched on over existing holders: those above the free number keep theirs
   const db = new Database(':memory:');
   db.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT NOT NULL, body TEXT)');
   const add = db.prepare('INSERT INTO records (id, holder_key, body) VALUES (?, ?, ?)');
-  for (let i = 0; i < 5; i++) add.run(`big-${i}`, 'h1:big', '{}');
-  add.run('small-0', 'h1:small', '{}');
+  const fpBody = (id) => JSON.stringify({ recordFingerprint: `fp-${id}` });
+  for (let i = 0; i < 5; i++) add.run(`big-${i}`, 'h1:big', fpBody(`big-${i}`));
+  add.run('small-0', 'h1:small', fpBody('small-0'));
   const b = createBilling(db, { env, hardCap: 10_000 });
   assert.equal(b.recordCapFor('h1:big'), 8);
   assert.equal(b.recordCapFor('h1:small'), 3);
   assert.equal(b.recordCapFor('h1:new'), 3);
   // Done when billing goes on: a holder who grows while it stays on is not grandfathered again.
-  for (let i = 0; i < 5; i++) add.run(`small-later-${i}`, 'h1:small', '{}');
+  for (let i = 0; i < 5; i++) add.run(`small-later-${i}`, 'h1:small', fpBody(`small-later-${i}`));
   assert.equal(createBilling(db, { env, hardCap: 10_000 }).recordCapFor('h1:small'), 3);
   // Off, then on again: done again, and a cap is only raised.
   createBilling(db, { env: {}, hardCap: 10_000 });
@@ -300,7 +301,7 @@ test('switched on over existing holders: those above the free number keep theirs
   const again = createBilling(db, { env, hardCap: 10_000 });
   assert.equal(again.recordCapFor('h1:small'), 9);
   assert.equal(again.recordCapFor('h1:big'), 8, 'not lowered');
-  // Every record they hold counts, so the room is the free number again.
+  // Every proof code they hold counts, so the room is the free number again.
   assert.equal(again.planRoom('h1:small').room, 3);
   // Off, or half configured: everyone keeps the registry's ceiling, as before.
   assert.equal(createBilling(db, { env: {}, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000);
@@ -501,25 +502,26 @@ test('billing ids are kept at least seven days, whatever the number', async () =
   assert.equal(count(), 20);
 });
 
-test('received deliveries do not count against the free plan, at switch-on or after', () => {
+test('received deliveries: the stub counts for nothing, the content the recipient seals does', () => {
   const db = new Database(':memory:');
   db.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT NOT NULL, body TEXT)');
   const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
-  for (let i = 0; i < 2; i++) add.run(`own-${i}`, 'h1:a', '{}');
-  for (let i = 0; i < 5; i++) add.run(`got-${i}`, 'h1:a', JSON.stringify({ receivedFrom: `VEIL-${i}` }));
-  // Seven held, two of their own: not grandfathered, and one more of their own fits under three.
+  add.run('own-0', 'h1:a', JSON.stringify({ recordFingerprint: 'fp-own-0' }));
+  // Claimed but not sealed yet: a stub with no proof code.
+  for (let i = 0; i < 3; i++) add.run(`stub-${i}`, 'h1:a', JSON.stringify({ receivedFrom: `VEIL-${i}` }));
+  // Received and sealed by the recipient: their own dated content.
+  add.run('got-0', 'h1:a', JSON.stringify({ receivedFrom: 'VEIL-9', recordFingerprint: 'fp-got-0' }));
   const b = createBilling(db, { env, hardCap: 10_000 });
   assert.equal(b.recordCapFor('h1:a'), 3);
   assert.equal(b.planRoom('h1:a').room, 1);
-  add.run('own-2', 'h1:a', '{}');
-  b.noteAdded('h1:a', ['own-2']);
+  b.noteAdded('h1:a', ['fp-own-1']);
   assert.equal(b.planRoom('h1:a').room, 0);
-  // Deleting one of their own doesn't give it back; saving it again doesn't count it twice.
+  // Deleting a record doesn't give its slot back; its proof code dated again doesn't count twice.
   db.prepare("DELETE FROM records WHERE id = 'own-0'").run();
   assert.equal(b.planRoom('h1:a').room, 0);
-  b.noteAdded('h1:a', ['own-0']);
+  b.noteAdded('h1:a', ['fp-own-0']);
   assert.equal(b.planRoom('h1:a').room, 0);
-  assert.equal(b.wasCounted('h1:a', 'own-0'), true);
+  assert.equal(b.wasCounted('h1:a', 'fp-own-0'), true);
 });
 
 test('checkout limits: ten per holder an hour, and fresh keys cannot reset anyone', async () => {
@@ -594,4 +596,71 @@ test('a plan and its counts follow the holder key when its stored form moves', (
   for (const t of tables) {
     assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE holder_key = ?`).get(now).n, 1, t);
   }
+});
+
+test('editing in place: the same content is always saved, new content under the same id counts', async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  // Same proof code, other unsealed fields changed: never refused.
+  const same = await saveAll(holder, [{ ...kept[0], strainName: 'renamed' }]);
+  assert.equal(same.json.ok, true, JSON.stringify(same.json));
+  // New content (a new proof code) under an old id is a new date: refused at the free number.
+  const newer = await saveAll(holder, [{ ...kept[0], recordFingerprint: hex() }]);
+  assert.deepEqual(newer.json.rejected?.map((r) => [r.id, r.code]), [[kept[0].id, 'plan-limit']]);
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+});
+
+test('deleting and reusing an id: new content counts, the same content does not', async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  assert.equal((await call('DELETE', '/api/records', holder, { ids: [kept[0].id] })).status, 200);
+  // New content under the deleted id: the third and last free date.
+  const reused = await saveAll(holder, [{ ...kept[0], recordFingerprint: hex() }]);
+  assert.equal(reused.json.ok, true, JSON.stringify(reused.json));
+  assert.equal((await plan(holder)).json.recordsCounted, 3);
+  assert.equal((await call('DELETE', '/api/records', holder, { ids: [kept[0].id] })).status, 200);
+  // Again with new content: refused, through the save and the dating route alike.
+  const again = { ...kept[0], recordFingerprint: hex() };
+  assert.equal((await saveAll(holder, [again])).json.rejected?.[0]?.code, 'plan-limit');
+  assert.equal(
+    (await call('PUT', '/api/records/dating', holder, [{ id: kept[0].id, recordFingerprint: again.recordFingerprint }])).json
+      .rejected?.[0]?.code,
+    'plan-limit',
+  );
+});
+
+test('a delivery: claiming needs free room, and the content the recipient seals is a date that counts', async () => {
+  const sender = hex();
+  const src = newRecord();
+  assert.equal((await saveAll(sender, [src])).json.ok, true);
+  const offer = async () => {
+    const sealedOffer = sealOfferForTest(offerFromRecord(src), randomBytes(32), src.id, src.recordFingerprint);
+    const o = await call('POST', '/transfers', sender, { sourceRecord: src.id, toHandle: handleTagFor(hex(), 'lab@x'), sealedOffer });
+    assert.equal(o.status, 200, JSON.stringify(o.json));
+    return o.json;
+  };
+  const recipient = hex();
+  assert.equal((await saveAll(recipient, [newRecord(), newRecord()])).json.ok, true);
+  const o = await offer();
+  const c = await call('POST', `/transfers/${o.transferId}/claim`, recipient, { claimCode: o.claimCode });
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  // The stub alone counts for nothing.
+  assert.equal((await plan(recipient)).json.recordsCounted, 2);
+  const stubId = c.json.recordId ?? c.json.receivedRecordId ?? c.json.id;
+  assert.equal(typeof stubId, 'string', JSON.stringify(c.json));
+  // Sealed with the recipient's own content: the third free date.
+  const sealed = await saveAll(recipient, [{ id: stubId, recordFingerprint: hex(), nonce: hex(), strainName: 'Got' }]);
+  assert.equal(sealed.json.ok, true, JSON.stringify(sealed.json));
+  assert.equal((await plan(recipient)).json.recordsCounted, 3);
+  // At the free number, a second claim is refused up front rather than left as a stub.
+  const o2 = await offer();
+  const c2 = await call('POST', `/transfers/${o2.transferId}/claim`, recipient, { claimCode: o2.claimCode });
+  assert.equal(c2.status, 413, JSON.stringify(c2.json));
+  assert.equal(c2.json.code, 'plan-limit');
+  // A correction of a received record isn't the free one: it counts, so it is refused here.
+  const fix = correctionOf({ id: stubId });
+  const r = await saveAll(recipient, [fix]);
+  assert.deepEqual(r.json.rejected?.map((x) => x.code), ['plan-limit'], JSON.stringify(r.json));
 });

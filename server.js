@@ -529,17 +529,18 @@ const MAX_PER_REQUEST = 10_000;
 const MAX_PER_HOLDER = 10_000;
 /**
  * Paid plans (billing.js). Off unless BILLING=on: then every holder's ceiling is
- * MAX_PER_HOLDER, as it always was. On, a holder without a paid plan may keep the free
- * number (BILLING_FREE_RECORDS), or what they held on the day it was switched on plus that.
- * Receiving a delivery (lineage/transfer.mjs) keeps MAX_PER_HOLDER: a lab or grower can
- * always take what was sent to them. Licences are not counted against a plan.
+ * MAX_PER_HOLDER, as it always was. On, a holder without a paid plan may have the free number
+ * (BILLING_FREE_RECORDS) of proof codes dated, or what they held on the day it was switched on
+ * plus that: the plan limits dates made, not records kept. Receiving a delivery
+ * (lineage/transfer.mjs) needs free room too: the recipient seals and dates the received record
+ * as their own content. Licences are not counted against a plan.
  */
 const { createBilling } = require('./billing.js');
 const billing = createBilling(db, { env: process.env, hardCap: MAX_PER_HOLDER });
 /** The refusal when a save would go past a holder's ceiling: says which ceiling it is. */
 const capRefusal = (cap) =>
   cap < MAX_PER_HOLDER
-    ? { error: `the free plan keeps ${cap} records here; a paid plan keeps more`, code: 'plan-limit', cap }
+    ? { error: `the free plan dates ${cap} records here; a paid plan dates more`, code: 'plan-limit', cap }
     : { error: `a holder may keep at most ${MAX_PER_HOLDER} records here` };
 /** The same, as one row's entry in `rejected`: a save refuses only its new rows past a ceiling. */
 const capRowRefusal = (id, cap) => {
@@ -1413,21 +1414,26 @@ app.put('/api/records', (req, res) => {
       plan.delete(item.id);
       plan.set(item.id, { item, body: JSON.stringify(toStore), prior, rev });
     }
-    // The ceilings, row by row: only new rows past one are refused, and the rest of the save is
-    // stored, so a holder at their plan's ceiling can always save edits even while a new record
-    // waits in their browser. An id held by another holder isn't new here (it isn't written).
+    // The ceilings, row by row: only rows past one are refused, and the rest of the save is
+    // stored, so a holder at their plan's ceiling can always save edits that keep the content
+    // (DNA paired, marked superseded) even while a new record waits in their browser. The free
+    // plan counts proof codes dated, so new content under an old id counts like a new record. An
+    // id held by another holder isn't written here, so it counts for nothing.
     // A record's one correction doesn't count on a plan: the registry takes one correction per
     // record (corrections.js), and a correction of a correction counts, so no chain of them
-    // dates new proof codes for free.
+    // dates new proof codes for free. A correction of a received record counts.
     const bodyTarget = (body) => {
       const t = JSON.parse(body).supersedes?.recordId;
       return typeof t === 'string' ? t : undefined;
     };
     const isPlainRecord = (id) => {
       const held = storedBody.get(id, holder);
-      if (held) return JSON.parse(held.body).supersedes === undefined;
+      if (held) {
+        const b = JSON.parse(held.body);
+        return b.supersedes === undefined && b.receivedFrom === undefined;
+      }
       const inSave = plan.get(id);
-      return !!inSave && bodyTarget(inSave.body) === undefined;
+      return !!inSave && bodyTarget(inSave.body) === undefined && JSON.parse(inSave.body).receivedFrom === undefined;
     };
     const freeTargets = new Map(); // free correction id -> the record it corrects
     for (const [id, r] of plan) {
@@ -1439,18 +1445,30 @@ app.put('/api/records', (req, res) => {
     }
     let hardRoom = MAX_PER_HOLDER - heldNow.get(holder).n;
     const room = billing.planRoom(holder);
-    for (const [id] of [...plan]) {
-      if (isMine.get(id, holder) || holderOfId.get(id)) continue;
-      const counts = !freeCorrections.has(id) && !billing.wasCounted(holder, id);
-      const cap = hardRoom <= 0 ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
+    const fpOf = (body) => {
+      const fp = JSON.parse(body).recordFingerprint;
+      return typeof fp === 'string' && fp ? fp : undefined;
+    };
+    const countingFps = new Set(); // proof codes this save would date anew on the plan
+    for (const [id, r] of [...plan]) {
+      const mine = !!isMine.get(id, holder);
+      if (!mine && holderOfId.get(id)) continue;
+      const fp = fpOf(r.body);
+      const changed = fp !== undefined && (!mine || !r.prior || fp !== fpOf(r.prior.body));
+      const counts =
+        changed && !freeCorrections.has(id) && !countingFps.has(fp) && !billing.wasCounted(holder, fp);
+      const cap = !mine && hardRoom <= 0 ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
       if (cap) {
         plan.delete(id);
         rejected.push(capRowRefusal(id, cap));
         capRefused.add(id);
         continue;
       }
-      hardRoom--;
-      if (counts) room.room--;
+      if (!mine) hardRoom--;
+      if (counts) {
+        room.room--;
+        countingFps.add(fp);
+      }
     }
     const before = heldBytes.get(holder).n;
     let after = before;
@@ -1529,6 +1547,7 @@ app.put('/api/records', (req, res) => {
       }
       const fresh = new Map();
       const inserted = []; // ids this save added for this holder
+      const writtenFps = []; // proof codes this save dated anew (countingFps that were written)
       for (const r of [...rows.filter((x) => targetOf(x) !== undefined), ...rows.filter((x) => targetOf(x) === undefined)]) {
         if (decided.has(r.item.id)) continue;
         try {
@@ -1539,9 +1558,11 @@ app.put('/api/records', (req, res) => {
             if (!r.prior) inserted.push(r.item.id);
             // Dated first as a bare proof code (counted then), now stored as a free correction.
             else if (freeCorrections.has(r.item.id) && isDatingOnlyBody(JSON.parse(r.prior.body))) {
-              billing.uncount(holder, r.item.id);
+              billing.uncount(holder, fpOf(r.prior.body));
               billing.noteFreeCorrection(holder, freeTargets.get(r.item.id));
             }
+            const fp = fpOf(r.body);
+            if (fp !== undefined && countingFps.has(fp)) writtenFps.push(fp);
           }
         } catch (e) {
           if (!isSecondCorrection(e)) throw e;
@@ -1559,7 +1580,7 @@ app.put('/api/records', (req, res) => {
         throw REDO;
       }
       for (const { id, supersededBy } of relinks) relink.run(supersededBy, now(), id, holder);
-      billing.noteAdded(holder, inserted.filter((id) => !freeCorrections.has(id)));
+      billing.noteAdded(holder, writtenFps);
       for (const id of inserted) if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id));
     });
     for (;;) {
@@ -1669,8 +1690,8 @@ app.put('/api/records/dating', (req, res) => {
         rejected.push({ id: item.id, reason: 'this fingerprint is already registered by another holder' });
         continue;
       }
-      // An id that counted before (added, then deleted) doesn't count again.
-      const counts = !billing.wasCounted(holder, item.id);
+      // A proof code that counted before (dated, then deleted) doesn't count again.
+      const counts = !billing.wasCounted(holder, item.recordFingerprint);
       const cap = held + 1 > MAX_PER_HOLDER ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
       if (cap) {
         rejected.push(capRowRefusal(item.id, cap));
@@ -1682,7 +1703,7 @@ app.put('/api/records/dating', (req, res) => {
       else {
         held++;
         if (counts) room.room--;
-        billing.noteAdded(holder, [item.id]);
+        billing.noteAdded(holder, [item.recordFingerprint]);
         dated.push(item.id);
       }
     }
@@ -2966,6 +2987,10 @@ app.post('/transfers/:id/claim', (req, res) => {
   if (!requireTransfers(res)) return;
   const holder = holderOf(req);
   if (!holder) return res.status(401).json({ error: 'holder key required' });
+  // The received record is sealed and dated by the recipient as their own content, so on the
+  // free plan it needs room. Refused here rather than left as a stub that can never be dated.
+  const planRoom = billing.planRoom(storedKeyOf(req));
+  if (planRoom.room <= 0) return res.status(413).json(capRefusal(planRoom.cap));
   const { code, ...out } = transfers.claim({
     transferId: req.params.id,
     holderKey: holder,

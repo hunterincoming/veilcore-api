@@ -69,8 +69,10 @@ const ATTEMPTS_PER_HOUR = 30;
 const ATTEMPTS_PER_HOUR_PER_IP = 60;
 
 const digest = (s) => createHash('sha256').update(`veilcore:billing-id:v1:${s}`).digest('hex');
-/** A record id as kept in billing_counted: digested, so the table names no record. */
+/** A record id as kept in billing_free_corrections: digested, so the table names no record. */
 const idDigest = (id) => createHash('sha256').update(`veilcore:billing-counted:v1:${id}`).digest('hex');
+/** A dated proof code as kept in billing_counted: digested, so the table holds no proof code. */
+const fpDigest = (fp) => createHash('sha256').update(`veilcore:billing-dated:v1:${fp}`).digest('hex');
 
 /**
  * Read the billing settings from the environment. Anything malformed switches billing off
@@ -182,9 +184,10 @@ const createBilling = (
       cap INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS billing_grandfathered_holder ON billing_grandfathered(holder_key);
-    -- The records that count against the free plan, one row per record id (digested), never
-    -- removed: deleting a record doesn't make room, and saving a deleted id again doesn't count
-    -- twice. Received deliveries and a record's one correction are not counted.
+    -- The proof codes that count against the free plan: one row per distinct proof code this
+    -- holder had dated (digested), never removed. The free plan limits dates made, not records
+    -- kept: deleting doesn't make room, the same content saved again doesn't count twice, and
+    -- new content under an old id counts. A record's one correction is not counted.
     CREATE TABLE IF NOT EXISTS billing_counted (
       holder_key TEXT NOT NULL,
       id_digest TEXT NOT NULL
@@ -209,26 +212,36 @@ const createBilling = (
     db.exec('ALTER TABLE billing_plans ADD COLUMN paid_through INTEGER');
   }
 
-  // The records that count: a holder's own (not received deliveries), less a record's one
-  // correction (a row correcting a record of the same holder that isn't itself a correction).
-  const COUNTS = `json_extract(r.body, '$.receivedFrom') IS NULL AND NOT EXISTS (
+  // What counts: every proof code a holder holds (received deliveries too, once they sealed
+  // their own content), less a record's one correction: a row correcting a record of the same
+  // holder that is neither a correction nor received.
+  const FREE_CORRECTION = `EXISTS (
     SELECT 1 FROM records t WHERE t.id = json_extract(r.body, '$.supersedes.recordId')
-      AND t.holder_key = r.holder_key AND json_extract(t.body, '$.supersedes') IS NULL)`;
-  const wasOn = db.prepare("SELECT v FROM billing_meta WHERE k = 'last_start'").get()?.v === 'on';
+      AND t.holder_key = r.holder_key AND json_extract(t.body, '$.supersedes') IS NULL
+      AND json_extract(t.body, '$.receivedFrom') IS NULL)`;
+  const COUNTS = `json_extract(r.body, '$.recordFingerprint') IS NOT NULL AND NOT ${FREE_CORRECTION}`;
+  // Counted by record id before 17 Nov (sandbox only): those rows are dropped and re-seeded.
+  const byFingerprint = db.prepare("SELECT v FROM billing_meta WHERE k = 'counted_by'").get()?.v === 'fingerprint';
+  if (!byFingerprint) {
+    db.exec('DELETE FROM billing_counted');
+    db.prepare("INSERT INTO billing_meta (k, v) VALUES ('counted_by', 'fingerprint') ON CONFLICT(k) DO UPDATE SET v = excluded.v").run();
+  }
+  const wasOn = byFingerprint && db.prepare("SELECT v FROM billing_meta WHERE k = 'last_start'").get()?.v === 'on';
   if (config.enabled && !wasOn) {
     // Switched on (first time, or again after a spell off): grandfather from what each holder
     // holds that counts, and count every such record not counted yet. A cap is only raised.
     db.transaction(() => {
       db.prepare(
         `INSERT INTO billing_grandfathered (holder_key, cap)
-         SELECT r.holder_key, COUNT(*) + ? FROM records r WHERE ${COUNTS} GROUP BY r.holder_key HAVING COUNT(*) > ?`,
+         SELECT r.holder_key, COUNT(DISTINCT json_extract(r.body, '$.recordFingerprint')) + ? FROM records r WHERE ${COUNTS}
+         GROUP BY r.holder_key HAVING COUNT(DISTINCT json_extract(r.body, '$.recordFingerprint')) > ?`,
       ).run(config.free, config.free);
       const add = db.prepare(
         `INSERT INTO billing_counted (holder_key, id_digest) SELECT ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM billing_counted WHERE holder_key = ? AND id_digest = ?)`,
       );
-      for (const r of db.prepare(`SELECT r.id, r.holder_key FROM records r WHERE ${COUNTS}`).all()) {
-        const d = idDigest(r.id);
+      for (const r of db.prepare(`SELECT json_extract(r.body, '$.recordFingerprint') AS fp, r.holder_key FROM records r WHERE ${COUNTS}`).all()) {
+        const d = fpDigest(r.fp);
         add.run(r.holder_key, d, r.holder_key, d);
       }
       // The free corrections already made are used.
@@ -237,7 +250,7 @@ const createBilling = (
          WHERE NOT EXISTS (SELECT 1 FROM billing_free_corrections WHERE holder_key = ? AND target_digest = ?)`,
       );
       for (const r of db.prepare(`SELECT r.holder_key, json_extract(r.body, '$.supersedes.recordId') AS target
-                                  FROM records r WHERE NOT (${COUNTS}) AND json_extract(r.body, '$.receivedFrom') IS NULL`).all()) {
+                                  FROM records r WHERE ${FREE_CORRECTION}`).all()) {
         const d = idDigest(r.target);
         used.run(r.holder_key, d, r.holder_key, d);
       }
@@ -287,7 +300,7 @@ const createBilling = (
     return Math.min(hardCap, Math.max(config.free, g?.cap ?? 0));
   };
 
-  /** Records that count against the free plan (billing_counted): deleted ones included. */
+  /** Proof codes that count against the free plan (billing_counted): deleted records' included. */
   const usedOf = (holder) => countedOf.get(holder).n;
 
   /**
@@ -301,13 +314,13 @@ const createBilling = (
     return { room: Math.max(0, cap - usedOf(holder)), cap };
   };
 
-  /** Whether this record id already counted for this holder (it was added, maybe deleted since). */
-  const wasCounted = (holder, id) => !!isCounted.get(holder, idDigest(id));
+  /** Whether this proof code already counted for this holder (dated before, maybe deleted since). */
+  const wasCounted = (holder, fp) => !!isCounted.get(holder, fpDigest(fp));
 
-  /** Count records just added (call inside the transaction that added them). Each id once. */
-  const noteAdded = (holder, ids) => {
+  /** Count proof codes just stored or dated (call inside the transaction that wrote them). Each once. */
+  const noteAdded = (holder, fps) => {
     if (!config.enabled) return;
-    for (const id of ids) if (!wasCounted(holder, id)) addCounted.run(holder, idDigest(id));
+    for (const fp of fps) if (typeof fp === 'string' && fp && !wasCounted(holder, fp)) addCounted.run(holder, fpDigest(fp));
   };
 
   /** Whether this record's one free correction is still to be used. Off: always (nothing counts). */
@@ -317,9 +330,9 @@ const createBilling = (
     if (config.enabled && correctionIsFree(holder, target)) addFreeUsed.run(holder, idDigest(target));
   };
 
-  /** A record counted when only its proof code was dated, now stored as a free correction. */
-  const uncount = (holder, id) => {
-    if (config.enabled) dropCounted.run(holder, idDigest(id));
+  /** A proof code counted when only it was dated, now stored as a free correction. */
+  const uncount = (holder, fp) => {
+    if (config.enabled && typeof fp === 'string') dropCounted.run(holder, fpDigest(fp));
   };
 
   const pruneIds = db.prepare(
@@ -511,7 +524,7 @@ const createBilling = (
       status: p?.status ?? null,
       periodEnd: p?.periodEnd ? new Date(p.periodEnd).toISOString() : null,
       recordsHeld,
-      // What counts against the free plan: records added, deleted or not (usedOf).
+      // What counts against the free plan: proof codes dated, records deleted or not (usedOf).
       recordsCounted: p ? recordsHeld : usedOf(holder),
       recordCap: recordCapFor(holder),
       plans: [...config.priceOfPlan.keys()],
