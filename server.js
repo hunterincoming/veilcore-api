@@ -442,10 +442,13 @@ const boundedSet = (map, key, value, isExpired) => {
  * which is what one Railway instance needs. Writes are tighter than reads.
  */
 const windows = new Map();
-const LIMITS = { write: 120, read: 600 }; // per minute
+// Paddle's webhook has its own, wider window: Paddle sends from a few shared addresses, and
+// a burst of renewals must not be refused. It is checked by signature before anything else.
+const LIMITS = { write: 120, read: 600, webhook: 1200 }; // per minute
 const isRead = (req) => req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+const isPaddleWebhook = (req) => req.method === 'POST' && req.path === '/api/billing/paddle';
 const rateLimit = (req, res, next) => {
-  const kind = isRead(req) ? 'read' : 'write';
+  const kind = isPaddleWebhook(req) ? 'webhook' : isRead(req) ? 'read' : 'write';
   const minute = Math.floor(Date.now() / 60_000);
   const key = `${kind}:${clientBucket(req.ip)}`;
   const w = windows.get(key);
@@ -1207,7 +1210,6 @@ app.put('/api/records', (req, res) => {
   const holder = storedKeyOf(req);
   if (!holder) return res.status(401).json({ error: 'holder key required' });
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'expected an array' });
-  const cap = billing.recordCapFor(holder);
   if (req.body.length > MAX_PER_REQUEST) {
     return res.status(413).json({ error: `at most ${MAX_PER_REQUEST} records per request` });
   }
@@ -1221,7 +1223,8 @@ app.put('/api/records', (req, res) => {
   const fresh = new Set(
     req.body.filter((r) => r && typeof r.id === 'string' && !isMine.get(r.id, holder)).map((r) => r.id),
   ).size;
-  if (held + fresh > cap) return res.status(413).json(capRefusal(cap));
+  const passed = billing.ceilingPassed(holder, held, fresh);
+  if (passed) return res.status(413).json(capRefusal(passed));
 
   // first_seen is when the registry first saw THIS content. Keeping it across an update
   // that changed the commitment let a holder store a placeholder, swap in different
@@ -1312,7 +1315,9 @@ app.put('/api/records', (req, res) => {
   const heldBytes = db.prepare('SELECT COALESCE(SUM(octet_length(body)), 0) AS n FROM records WHERE holder_key = ?');
   let written = 0;
   let projectedBytes = 0;
+  let passedInTx = 0;
   const tx = db.transaction((items) => {
+    const heldAtStart = heldNow.get(holder).n;
     let kid = vaultKidOf(holder);
     // One entry per id, the last copy sent (round 2): the same id several times in one
     // save was each counted against the stored row, so small copies followed by a big one
@@ -1412,7 +1417,8 @@ app.put('/api/records', (req, res) => {
       plan.set(item.id, { item, body: JSON.stringify(toStore), prior, rev });
     }
     const freshNow = [...plan.keys()].filter((id) => !isMine.get(id, holder)).length;
-    if (heldNow.get(holder).n + freshNow > cap) return 'count';
+    passedInTx = billing.ceilingPassed(holder, heldNow.get(holder).n, freshNow);
+    if (passedInTx) return 'count';
     const before = heldBytes.get(holder).n;
     let after = before;
     for (const [id, { body, prior }] of plan) {
@@ -1511,6 +1517,7 @@ app.put('/api/records', (req, res) => {
         throw REDO;
       }
       for (const { id, supersededBy } of relinks) relink.run(supersededBy, now(), id, holder);
+      billing.noteAdded(holder, heldNow.get(holder).n - heldAtStart);
     });
     for (;;) {
       try {
@@ -1523,7 +1530,7 @@ app.put('/api/records', (req, res) => {
     return 'ok';
   });
   const outcome = tx(shaped);
-  if (outcome === 'count') return res.status(413).json(capRefusal(cap));
+  if (outcome === 'count') return res.status(413).json(capRefusal(passedInTx));
   if (outcome === 'bytes') {
     return res.status(413).json({
       error: `a holder may keep at most ${megabytes(HOLDER_MAX_BYTES)} of records here; this save would make it ${megabytes(projectedBytes)}. Nothing was changed.`,
@@ -1578,7 +1585,6 @@ const putDating = db.prepare(
 app.put('/api/records/dating', (req, res) => {
   const holder = storedKeyOf(req);
   if (!holder) return res.status(401).json({ error: 'holder key required' });
-  const cap = billing.recordCapFor(holder);
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'expected an array of { id, recordFingerprint, keyBinding? }' });
   if (req.body.length > DATING_MAX_PER_REQUEST) {
     return res.status(413).json({ error: `at most ${DATING_MAX_PER_REQUEST} dating rows per request` });
@@ -1620,8 +1626,9 @@ app.put('/api/records/dating', (req, res) => {
         rejected.push({ id: item.id, reason: 'this fingerprint is already registered by another holder' });
         continue;
       }
-      if (held + 1 > cap) {
-        const r = capRefusal(cap);
+      const passed = billing.ceilingPassed(holder, held, 1);
+      if (passed) {
+        const r = capRefusal(passed);
         rejected.push({ id: item.id, reason: r.error, ...(r.code ? { code: r.code } : {}) });
         continue;
       }
@@ -1630,6 +1637,7 @@ app.put('/api/records/dating', (req, res) => {
       if (info.changes === 0) notWritten.push(item.id);
       else {
         held++;
+        billing.noteAdded(holder, 1);
         dated.push(item.id);
       }
     }

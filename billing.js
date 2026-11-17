@@ -32,8 +32,11 @@ const EVENT_KEEP_MS = 30 * 86_400_000;
 /** Statuses that count as paid whatever the date. */
 const PAID_NOW = new Set(['active', 'trialing']);
 /** Statuses that count as paid until the period ends, plus the grace. */
-const PAID_UNTIL_END = new Set(['past_due', 'canceled', 'paused']);
-const STATUSES = new Set([...PAID_NOW, ...PAID_UNTIL_END]);
+const PAID_UNTIL_END = new Set(['canceled', 'paused']);
+/** A renewal that failed: paid for the grace only, counted from when it first failed. Paddle
+ *  moves the period on when a renewal fails, so its period end would be a month unpaid. */
+const PAST_DUE = 'past_due';
+const STATUSES = new Set([...PAID_NOW, ...PAID_UNTIL_END, PAST_DUE]);
 const EVENT_TYPES = new Set([
   'subscription.created',
   'subscription.activated',
@@ -45,8 +48,15 @@ const EVENT_TYPES = new Set([
   'subscription.trialing',
 ]);
 const BILLING_ID = /^[0-9a-f]{64}$/;
-/** Billing ids kept per holder; older ones stop working. */
+/** Billing ids kept per holder; older ones stop working, but never before BILLING_ID_MIN_AGE_MS,
+ *  so a checkout someone is still paying for always lands. */
 const BILLING_IDS_KEPT = 20;
+const BILLING_ID_MIN_AGE_MS = 7 * 86_400_000;
+/** Holders tracked for the checkout limit in one hour. Past it, new holders wait for the next
+ *  hour: flooding with fresh keys can't reset anyone's count. */
+const CHECKOUT_HOLDERS_PER_HOUR = 5_000;
+/** Checkouts all holders together may open in an hour. */
+const CHECKOUTS_PER_HOUR_ALL = 2_000;
 const PADDLE_ID = /^[a-z]{2,4}_[0-9a-z]{10,64}$/;
 /** Paddle's two API hosts. A sandbox key works only on the sandbox one, and the reverse. */
 const PADDLE_API = { sandbox: 'https://sandbox-api.paddle.com', live: 'https://api.paddle.com' };
@@ -62,11 +72,12 @@ const digest = (s) => createHash('sha256').update(`veilcore:billing-id:v1:${s}`)
  * with a reason, rather than starting half configured.
  */
 const billingConfig = (env, hardCap) => {
-  if (env.BILLING !== 'on') return { enabled: false, reason: 'BILLING is not on' };
+  if (env.BILLING !== 'on') return { enabled: false, reason: `BILLING is "${String(env.BILLING ?? '')}", not "on"` };
   const secret = env.BILLING_PADDLE_WEBHOOK_SECRET ?? '';
   if (secret.length < 16) return { enabled: false, reason: 'BILLING_PADDLE_WEBHOOK_SECRET is missing' };
-  const free = Number.parseInt(env.BILLING_FREE_RECORDS ?? '', 10);
-  if (!Number.isInteger(free) || free < 0 || free > hardCap) {
+  const freeText = env.BILLING_FREE_RECORDS ?? '';
+  const free = /^\d{1,6}$/.test(freeText) ? Number(freeText) : NaN;
+  if (!Number.isInteger(free) || free > hardCap) {
     return { enabled: false, reason: 'BILLING_FREE_RECORDS must be a whole number' };
   }
   const prices = new Map();
@@ -146,6 +157,7 @@ const createBilling = (
       plan TEXT NOT NULL,
       status TEXT NOT NULL,
       period_end INTEGER,
+      past_due_since INTEGER,
       occurred_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -157,24 +169,35 @@ const createBilling = (
     -- Holders above the free number on the day billing was first switched on keep what they
     -- hold and may add the free number again, for good: nobody is cut off by a change they
     -- didn't choose.
+    -- Not unique on holder_key: the holder-key migration (holder-key.js) moves rows from an
+    -- old key form to the new one, and two forms of one key may each have a row.
     CREATE TABLE IF NOT EXISTS billing_grandfathered (
-      holder_key TEXT PRIMARY KEY,
+      holder_key TEXT NOT NULL,
       cap INTEGER NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS billing_grandfathered_holder ON billing_grandfathered(holder_key);
+    -- Records a holder added while billing was on, never lowered: on the free plan this is
+    -- what counts, so deleting a record doesn't make room for another. Rows per key form are
+    -- summed, as above. Received deliveries are not counted.
+    CREATE TABLE IF NOT EXISTS billing_added (
+      holder_key TEXT NOT NULL,
+      n INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS billing_added_holder ON billing_added(holder_key);
     CREATE TABLE IF NOT EXISTS billing_meta (
       k TEXT PRIMARY KEY,
       v TEXT NOT NULL
     );
   `);
   const config = billingConfig(env, hardCap);
-  if (!config.enabled && env.BILLING === 'on') console.error(`billing stays off: ${config.reason}`);
+  if (!config.enabled && (env.BILLING ?? '') !== '') console.error(`billing stays off: ${config.reason}`);
 
   if (config.enabled) {
     const done = db.prepare("SELECT v FROM billing_meta WHERE k = 'grandfathered_at'").get();
     if (!done) {
       db.transaction(() => {
         db.prepare(
-          `INSERT OR IGNORE INTO billing_grandfathered (holder_key, cap)
+          `INSERT INTO billing_grandfathered (holder_key, cap)
            SELECT holder_key, COUNT(*) + ? FROM records GROUP BY holder_key HAVING COUNT(*) > ?`,
         ).run(config.free, config.free);
         db.prepare("INSERT INTO billing_meta (k, v) VALUES ('grandfathered_at', ?)").run(String(now()));
@@ -182,8 +205,16 @@ const createBilling = (
     }
   }
 
-  const plansOf = db.prepare('SELECT plan, status, period_end FROM billing_plans WHERE holder_key = ?');
-  const grandfatheredOf = db.prepare('SELECT cap FROM billing_grandfathered WHERE holder_key = ?');
+  const plansOf = db.prepare('SELECT plan, status, period_end, past_due_since FROM billing_plans WHERE holder_key = ?');
+  const grandfatheredOf = db.prepare('SELECT MAX(cap) AS cap FROM billing_grandfathered WHERE holder_key = ?');
+  const addedOf = db.prepare('SELECT COUNT(*) AS rows, COALESCE(SUM(n), 0) AS n FROM billing_added WHERE holder_key = ?');
+  const ownHeld = db.prepare(
+    "SELECT COUNT(*) AS n FROM records WHERE holder_key = ? AND json_extract(body, '$.receivedFrom') IS NULL",
+  );
+  const bumpAdded = db.prepare(
+    'UPDATE billing_added SET n = n + ? WHERE rowid = (SELECT rowid FROM billing_added WHERE holder_key = ? LIMIT 1)',
+  );
+  const insertAdded = db.prepare('INSERT INTO billing_added (holder_key, n) VALUES (?, ?)');
 
   /** The best plan this holder has right now, or null. */
   const currentPlan = (holder) => {
@@ -191,7 +222,9 @@ const createBilling = (
     let best = null;
     for (const p of plansOf.all(holder)) {
       const paid =
-        PAID_NOW.has(p.status) || (PAID_UNTIL_END.has(p.status) && p.period_end && t < p.period_end + GRACE_MS);
+        PAID_NOW.has(p.status) ||
+        (PAID_UNTIL_END.has(p.status) && p.period_end && t < p.period_end + GRACE_MS) ||
+        (p.status === PAST_DUE && p.past_due_since && t < p.past_due_since + GRACE_MS);
       if (paid && (!best || (p.period_end ?? Infinity) > (best.periodEnd ?? 0))) {
         best = { plan: p.plan, status: p.status, periodEnd: p.period_end ?? null };
       }
@@ -204,11 +237,39 @@ const createBilling = (
     if (!config.enabled) return hardCap;
     if (currentPlan(holder)) return hardCap;
     const g = grandfatheredOf.get(holder);
-    return Math.min(hardCap, Math.max(config.free, g ? g.cap : 0));
+    return Math.min(hardCap, Math.max(config.free, g?.cap ?? 0));
+  };
+
+  /** Records that count against the free plan: those added since billing went on, starting
+   *  from what the holder held themselves (not received) the first time it was asked. */
+  const usedOf = (holder) => {
+    const a = addedOf.get(holder);
+    return a.rows ? a.n : ownHeld.get(holder).n;
+  };
+
+  /**
+   * Whether adding `fresh` new records would go past this holder's ceiling, given `held`
+   * now. A save that adds nothing is never refused: stopping payment never stops edits.
+   * Returns the ceiling it would pass, or 0.
+   */
+  const ceilingPassed = (holder, held, fresh) => {
+    if (!(fresh > 0)) return 0;
+    if (held + fresh > hardCap) return hardCap;
+    if (!config.enabled || currentPlan(holder)) return 0;
+    const cap = recordCapFor(holder);
+    return usedOf(holder) + fresh > cap ? cap : 0;
+  };
+
+  /** Count `n` records just added (call inside the transaction that added them). */
+  const noteAdded = (holder, n) => {
+    if (!config.enabled || !(n > 0)) return;
+    if (bumpAdded.run(n, holder).changes) return;
+    // First count for this holder: what they held of their own before these n.
+    insertAdded.run(holder, Math.max(0, ownHeld.get(holder).n - n) + n);
   };
 
   const pruneIds = db.prepare(
-    `DELETE FROM billing_ids WHERE holder_key = ? AND id_digest NOT IN (
+    `DELETE FROM billing_ids WHERE holder_key = ? AND created_at < ? AND id_digest NOT IN (
        SELECT id_digest FROM billing_ids WHERE holder_key = ? ORDER BY created_at DESC LIMIT ?)`,
   );
   const insertId = db.prepare('INSERT INTO billing_ids (id_digest, holder_key, created_at) VALUES (?, ?, ?)');
@@ -218,11 +279,13 @@ const createBilling = (
   const forgetEvents = db.prepare('DELETE FROM billing_events WHERE received_at < ?');
   const planRow = db.prepare('SELECT occurred_at, holder_key FROM billing_plans WHERE subscription_id = ?');
   const upsertPlan = db.prepare(
-    `INSERT INTO billing_plans (subscription_id, holder_key, plan, status, period_end, occurred_at, updated_at)
-     VALUES (@sub, @holder, @plan, @status, @periodEnd, @occurredAt, @updatedAt)
+    `INSERT INTO billing_plans (subscription_id, holder_key, plan, status, period_end, past_due_since, occurred_at, updated_at)
+     VALUES (@sub, @holder, @plan, @status, @periodEnd, @pastDueSince, @occurredAt, @updatedAt)
      ON CONFLICT(subscription_id) DO UPDATE SET
        plan = excluded.plan, status = excluded.status,
        period_end = COALESCE(excluded.period_end, billing_plans.period_end),
+       past_due_since = CASE WHEN excluded.status = 'past_due'
+         THEN COALESCE(billing_plans.past_due_since, excluded.past_due_since) ELSE NULL END,
        occurred_at = excluded.occurred_at, updated_at = excluded.updated_at`,
   );
 
@@ -235,7 +298,7 @@ const createBilling = (
   const issueId = db.transaction((holder) => {
     const id = randomBytes(32).toString('hex');
     insertId.run(digest(id), holder, now());
-    pruneIds.run(holder, holder, BILLING_IDS_KEPT);
+    pruneIds.run(holder, now() - BILLING_ID_MIN_AGE_MS, holder, BILLING_IDS_KEPT);
     return id;
   });
 
@@ -250,36 +313,37 @@ const createBilling = (
     const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
     if (!PADDLE_ID.test(eventId)) return { status: 400, body: { error: 'no event id' } };
     if (seenEvent.get(eventId)) return { status: 200, body: { ok: true, repeat: true } };
-    keepEvent.run(eventId, t);
-    if (!EVENT_TYPES.has(event.event_type)) return { status: 200, body: { ok: true, ignored: 'event type' } };
+    // The id is kept only once the event is settled (applied, or not ours for good). An event
+    // that couldn't be applied yet answers 5xx and isn't kept, so Paddle sends it again.
+    const settled = (body) => {
+      keepEvent.run(eventId, t);
+      return { status: 200, body: { ok: true, ...body } };
+    };
+    const retry = (why) => {
+      console.error(`billing: NOT APPLIED, Paddle will retry: ${why}`);
+      return { status: 503, body: { error: 'not applied yet; retry' } };
+    };
+    if (!EVENT_TYPES.has(event.event_type)) return settled({ ignored: 'event type' });
     const d = event.data ?? {};
     const sub = typeof d.id === 'string' && PADDLE_ID.test(d.id) ? d.id : '';
     const status = STATUSES.has(d.status) ? d.status : '';
     const billingId = d.custom_data?.veilcoreBillingId;
-    if (!sub || !status) return { status: 200, body: { ok: true, ignored: 'not a subscription' } };
+    if (!sub || !status) return settled({ ignored: 'not a subscription' });
     const occurredAt = Date.parse(event.occurred_at ?? '');
     if (!Number.isFinite(occurredAt)) return { status: 400, body: { error: 'no occurred_at' } };
     const prior = planRow.get(sub);
     let holder = prior?.holder_key;
     if (!holder) {
-      if (typeof billingId !== 'string' || !BILLING_ID.test(billingId)) {
-        return { status: 200, body: { ok: true, ignored: 'no billing id' } };
-      }
+      if (typeof billingId !== 'string' || !BILLING_ID.test(billingId)) return settled({ ignored: 'no billing id' });
       holder = holderOfId.get(digest(billingId))?.holder_key;
-      if (!holder) {
-        // Someone paid and nothing here says for whom. Said in the log, by subscription id
-        // only, so the operator can match it in Paddle and set it right.
-        console.warn(`billing: subscription ${sub} names a billing id this registry doesn't know`);
-        return { status: 200, body: { ok: true, ignored: 'unknown billing id' } };
-      }
+      // Someone paid and nothing here says for whom: by subscription id only, so the operator
+      // can match it in Paddle.
+      if (!holder) return retry(`subscription ${sub} names a billing id this registry doesn't know`);
     }
     // Paddle doesn't promise order: an event older than the one already applied changes nothing.
-    if (prior && occurredAt < prior.occurred_at) return { status: 200, body: { ok: true, ignored: 'older event' } };
+    if (prior && occurredAt < prior.occurred_at) return settled({ ignored: 'older event' });
     const plans = new Set((d.items ?? []).map((i) => config.prices.get(i?.price?.id)).filter(Boolean));
-    if (plans.size !== 1) {
-      console.warn(`billing: subscription ${sub} has no price in BILLING_PADDLE_PRICES (or more than one plan)`);
-      return { status: 200, body: { ok: true, ignored: 'no known price' } };
-    }
+    if (plans.size !== 1) return retry(`subscription ${sub} has no price in BILLING_PADDLE_PRICES (or more than one plan)`);
     const periodEnd = Date.parse(d.current_billing_period?.ends_at ?? '');
     upsertPlan.run({
       sub,
@@ -287,10 +351,11 @@ const createBilling = (
       plan: [...plans][0],
       status,
       periodEnd: Number.isFinite(periodEnd) ? periodEnd : null,
+      pastDueSince: status === PAST_DUE ? occurredAt : null,
       occurredAt,
       updatedAt: t,
     });
-    return { status: 200, body: { ok: true } };
+    return settled({});
   });
 
   const off = (res) => res.status(404).json({ error: 'paid plans are not switched on' });
@@ -314,7 +379,10 @@ const createBilling = (
     return res.status(r.status).json(r.body);
   };
 
-  const checkoutsBy = new Map();
+  const checkoutsBy = new Map(); // holder -> checkouts opened this hour
+  let checkoutHour = -1;
+  let checkoutsAll = 0;
+  const holdsARecord = db.prepare('SELECT 1 FROM records WHERE holder_key = ? LIMIT 1');
   /**
    * POST /api/billing/checkout { plan }, for the holder in `holder` (the stored key). Opens a
    * transaction in Paddle carrying a new billing id, and answers the hosted checkout link for
@@ -325,12 +393,21 @@ const createBilling = (
     if (!holder) return res.status(401).json({ error: 'holder key required' });
     const price = config.priceOfPlan.get(body?.plan);
     if (!price) return res.status(400).json({ error: 'no such plan' });
+    // A plan is for keeping records: a key that holds none has nothing to pay for yet, and
+    // random keys can't open transactions in Paddle on VeilCore's account.
+    if (!holdsARecord.get(holder)) return res.status(409).json({ error: 'save a record first; a plan is for the records you keep' });
     const hour = Math.floor(now() / 3_600_000);
-    const used = checkoutsBy.get(holder);
-    const count = used && used.hour === hour ? used.n + 1 : 1;
-    if (checkoutsBy.size > 10_000) checkoutsBy.clear();
-    checkoutsBy.set(holder, { hour, n: count });
-    if (count > CHECKOUTS_PER_HOUR) return res.status(429).json({ error: 'too many checkouts opened; try again in an hour' });
+    if (hour !== checkoutHour) {
+      checkoutHour = hour;
+      checkoutsAll = 0;
+      checkoutsBy.clear(); // only last hour's counts: every one of them has expired
+    }
+    const busy = () => res.status(429).json({ error: 'too many checkouts opened; try again in an hour' });
+    if (!checkoutsBy.has(holder) && checkoutsBy.size >= CHECKOUT_HOLDERS_PER_HOUR) return busy();
+    const count = (checkoutsBy.get(holder) ?? 0) + 1;
+    if (count > CHECKOUTS_PER_HOUR || checkoutsAll >= CHECKOUTS_PER_HOUR_ALL) return busy();
+    checkoutsBy.set(holder, count);
+    checkoutsAll++;
     const billingId = issueId(holder);
     let txn;
     try {
@@ -360,11 +437,23 @@ const createBilling = (
       status: p?.status ?? null,
       periodEnd: p?.periodEnd ? new Date(p.periodEnd).toISOString() : null,
       recordsHeld,
+      // What counts against the free plan: records added, deleted or not (usedOf).
+      recordsCounted: p ? recordsHeld : usedOf(holder),
       recordCap: recordCapFor(holder),
+      plans: [...config.priceOfPlan.keys()],
     });
   };
 
-  return { enabled: config.enabled, plans: config.enabled ? [...config.priceOfPlan.keys()] : [], recordCapFor, webhook, checkout, planOf };
+  return {
+    enabled: config.enabled,
+    plans: config.enabled ? [...config.priceOfPlan.keys()] : [],
+    recordCapFor,
+    ceilingPassed,
+    noteAdded,
+    webhook,
+    checkout,
+    planOf,
+  };
 };
 
 module.exports = { createBilling, signatureOk, billingConfig, GRACE_MS, SIGNATURE_TOLERANCE_MS };

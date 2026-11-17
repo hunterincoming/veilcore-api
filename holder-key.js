@@ -68,6 +68,11 @@ const HOLDER_KEY_COLUMNS = [
   // The first holder of each fingerprint (fingerprint-holders.js, 9 Nov 2026): a key moved to
   // its stored form keeps the fingerprints it held first.
   ['fingerprint_holders', 'holder_key'],
+  // Paid plans (billing.js): a plan, its billing ids and the free-plan counts follow the key.
+  ['billing_ids', 'holder_key'],
+  ['billing_plans', 'holder_key'],
+  ['billing_grandfathered', 'holder_key'],
+  ['billing_added', 'holder_key'],
 ];
 
 /** Columns among HOLDER_KEY_COLUMNS that exist in this database. */

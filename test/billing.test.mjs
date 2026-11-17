@@ -10,7 +10,11 @@
 //   - the free number holds on every route that adds a record (save and dating), and the
 //     refusal says it is the plan's;
 //   - holders over the free number on the day billing is switched on keep what they hold and
-//     may add the free number again.
+//     may add the free number again;
+//   - a save that adds nothing is never refused, and deleting doesn't make room on the free
+//     plan; received deliveries don't count against it;
+//   - a checkout needs a record held; a past_due plan is paid for the grace only; an event
+//     that can't be applied yet is answered 5xx and not kept, so Paddle sends it again.
 // billing-off.test.mjs holds that, switched off, nothing changes. No network.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -87,9 +91,19 @@ const call = async (method, path, holder, body) => {
 };
 const date = (holder, n) => call('PUT', '/api/records/dating', holder, Array.from({ length: n }, () => ({ id: recordId(), recordFingerprint: hex() })));
 // testBody seals each record as the browser does, with the holder's vault key.
-const save = (holder) => call('PUT', '/api/records', holder, [{ id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'S' }]);
+const newRecord = () => ({ id: recordId(), recordFingerprint: hex(), nonce: hex(), strainName: 'S' });
+const saveAll = (holder, records) => call('PUT', '/api/records', holder, records);
+const save = (holder) => saveAll(holder, [newRecord()]);
 const plan = (holder) => call('GET', '/api/billing/plan', holder);
-const checkout = (holder, planName = 'breeder') => call('POST', '/api/billing/checkout', holder, { plan: planName });
+// A checkout needs a record held: each test holder gets one dated first, once.
+const holding = new Set();
+const checkout = async (holder, planName = 'breeder') => {
+  if (holder && !holding.has(holder)) {
+    holding.add(holder);
+    await date(holder, 1);
+  }
+  return call('POST', '/api/billing/checkout', holder, { plan: planName });
+};
 /** Open a checkout as the holder would, and read the billing id it carried, as Paddle would. */
 const billingId = async (holder) => {
   const r = await checkout(holder);
@@ -139,7 +153,15 @@ test('free: three records, then the save and the dating route both refuse, sayin
   const dated = await date(holder, 1);
   assert.equal(dated.json.rejected?.[0]?.code, 'plan-limit', JSON.stringify(dated.json));
   const p = await plan(holder);
-  assert.deepEqual(p.json, { plan: 'free', status: null, periodEnd: null, recordsHeld: 3, recordCap: 3 });
+  assert.deepEqual(p.json, {
+    plan: 'free',
+    status: null,
+    periodEnd: null,
+    recordsHeld: 3,
+    recordsCounted: 3,
+    recordCap: 3,
+    plans: ['breeder', 'lab'],
+  });
 });
 
 test('a checkout goes to Paddle with a billing id, never the holder key; earlier ids still work', async () => {
@@ -245,13 +267,14 @@ test('an older event, a price we do not sell, or an unknown billing id changes n
 
   const other = hex();
   const otherId = await billingId(other);
-  const unknownPrice = await send(event('subscription.created', { billingId: otherId, sub: subId(), price: 'pri_01notours00000001' }));
-  assert.deepEqual(unknownPrice.json, { ok: true, ignored: 'no known price' });
-  const unknownId = await send(event('subscription.created', { billingId: hex(), sub: subId() }));
-  assert.deepEqual(unknownId.json, { ok: true, ignored: 'unknown billing id' });
+  // A price we don't sell, or a billing id we don't know: not applied, answered 5xx so Paddle
+  // sends it again (the operator fixes the setting meanwhile), and not kept as seen.
+  const priced = event('subscription.created', { billingId: otherId, sub: subId(), price: 'pri_01notours00000001' });
+  assert.equal((await send(priced)).status, 503);
+  assert.equal((await send(priced)).status, 503, 'not refused as a repeat');
+  assert.equal((await send(event('subscription.created', { billingId: hex(), sub: subId() }))).status, 503);
   // Someone puts a holder key where the billing id goes: it is not one.
-  const keyAsId = await send(event('subscription.created', { billingId: other, sub: subId() }));
-  assert.deepEqual(keyAsId.json, { ok: true, ignored: 'unknown billing id' });
+  assert.equal((await send(event('subscription.created', { billingId: other, sub: subId() }))).status, 503);
   assert.equal((await plan(other)).json.plan, 'free');
   // Not a subscription event: acknowledged so Paddle stops retrying, nothing stored.
   assert.deepEqual((await send(event('transaction.completed', { sub: subId() }))).json, { ok: true, ignored: 'event type' });
@@ -280,7 +303,188 @@ test('switched on over existing holders: those above the free number keep theirs
     { BILLING_PADDLE_API_KEY: '' },
     { BILLING_PADDLE_CHECKOUT: 'https://evil.example/checkout/hsc_01testcheckout000001' },
     { BILLING_PADDLE_PRICES: `${BREEDER}=breeder,${LAB}=breeder` },
+    { BILLING_FREE_RECORDS: '3abc' },
+    { BILLING_FREE_RECORDS: '' },
+    { BILLING: 'On' },
   ]) {
     assert.equal(createBilling(db, { env: { ...env, ...wrong }, hardCap: 10_000 }).recordCapFor('h1:new'), 10_000, JSON.stringify(wrong));
+  }
+});
+
+test('a holder above the ceiling can still save edits; only new records are refused', async () => {
+  const holder = hex();
+  const kept = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, kept)).json.ok, true);
+  // Paid, then lapsed past the grace: over nothing, at the ceiling.
+  const bid = await billingId(holder);
+  const sub = subId();
+  await send(event('subscription.created', { billingId: bid, sub }));
+  assert.equal((await date(holder, 2)).json.dated?.length, 2);
+  const ended = new Date(Date.now() - GRACE_MS - 86_400_000).toISOString();
+  await send(event('subscription.canceled', { sub, status: 'canceled', endsAt: ended }));
+  assert.equal((await plan(holder)).json.plan, 'free');
+  // The whole set re-sent, as the app does on every change: saved.
+  const again = await saveAll(holder, kept);
+  assert.equal(again.status, 200, JSON.stringify(again.json));
+  // Anything new in it: the plan's refusal, and nothing written.
+  const more = await saveAll(holder, [...kept, newRecord()]);
+  assert.equal(more.json.code, 'plan-limit');
+});
+
+test('on the free plan, deleting a record does not make room for another', async () => {
+  const holder = hex();
+  const records = [newRecord(), newRecord(), newRecord()];
+  assert.equal((await saveAll(holder, records)).json.ok, true);
+  const del = await call('DELETE', '/api/records', holder, { ids: [records[0].id] });
+  assert.equal(del.status, 200, JSON.stringify(del.json));
+  const p = await plan(holder);
+  assert.deepEqual([p.json.recordsHeld, p.json.recordsCounted, p.json.recordCap], [2, 3, 3]);
+  assert.equal((await save(holder)).json.code, 'plan-limit');
+  assert.equal((await date(holder, 1)).json.rejected?.[0]?.code, 'plan-limit');
+});
+
+test('a checkout needs a record held', async () => {
+  const before = opened.length;
+  const r = await call('POST', '/api/billing/checkout', hex(), { plan: 'breeder' });
+  assert.equal(r.status, 409);
+  assert.equal(opened.length, before, 'Paddle not asked');
+});
+
+// A billing instance on its own database and clock, for what depends on time.
+const standalone = () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE records (id TEXT PRIMARY KEY, holder_key TEXT NOT NULL, body TEXT)');
+  const clock = { t: Date.parse('2027-01-01T00:00:00Z') };
+  const sent = [];
+  const fetchImpl = async (_url, init) => {
+    sent.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ data: { id: `txn_01${hex(10)}` } }), { status: 201 });
+  };
+  const b = createBilling(db, { env, hardCap: 10_000, now: () => clock.t, fetchImpl });
+  const answer = () => {
+    const r = { code: 200, body: null };
+    return { r, status(c) { r.code = c; return this; }, json(j) { r.body = j; return this; } };
+  };
+  const checkoutId = async (holder) => {
+    const out = answer();
+    await b.checkout(holder, { plan: 'breeder' }, out);
+    assert.equal(out.r.code, 200, JSON.stringify(out.r.body));
+    return sent.at(-1).custom_data.veilcoreBillingId;
+  };
+  const hook = (ev) => {
+    const raw = Buffer.from(JSON.stringify(ev));
+    const ts = Math.floor(clock.t / 1000);
+    const sig = `ts=${ts};h1=${createHmac('sha256', SECRET).update(`${ts}:`).update(raw).digest('hex')}`;
+    const out = answer();
+    b.webhook({ get: () => sig, body: raw }, out);
+    return out.r;
+  };
+  return { db, clock, b, checkoutId, hook };
+};
+
+test('past_due is paid for the grace from the first failed renewal, not to the new period end', async () => {
+  const { db, clock, b, checkoutId, hook } = standalone();
+  db.prepare('INSERT INTO records VALUES (?, ?, ?)').run('r1', 'h1:a', '{}');
+  const bid = await checkoutId('h1:a');
+  const sub = subId();
+  const at = () => new Date(clock.t).toISOString();
+  const later = new Date(clock.t + 60 * 86_400_000).toISOString();
+  assert.equal(hook(event('subscription.created', { billingId: bid, sub, occurredAt: at() })).code, 200);
+  assert.equal(b.recordCapFor('h1:a'), 10_000);
+  clock.t += 30 * 86_400_000;
+  // The renewal fails; Paddle has moved the period on a month.
+  hook(event('subscription.past_due', { sub, status: 'past_due', endsAt: later, occurredAt: at() }));
+  assert.equal(b.recordCapFor('h1:a'), 10_000, 'paid during the grace');
+  clock.t += GRACE_MS - 86_400_000;
+  // Another past_due update doesn't restart the grace.
+  hook(event('subscription.updated', { sub, status: 'past_due', endsAt: later, occurredAt: at() }));
+  clock.t += 2 * 86_400_000;
+  assert.equal(b.recordCapFor('h1:a'), 3, 'grace over, though the period runs on');
+  // Paid at last: active again.
+  hook(event('subscription.updated', { sub, status: 'active', endsAt: later, occurredAt: at() }));
+  assert.equal(b.recordCapFor('h1:a'), 10_000);
+});
+
+test('billing ids are kept at least seven days, whatever the number', async () => {
+  const { db, clock, checkoutId } = standalone();
+  db.prepare('INSERT INTO records VALUES (?, ?, ?)').run('r1', 'h1:a', '{}');
+  const count = () => db.prepare("SELECT COUNT(*) AS n FROM billing_ids WHERE holder_key = 'h1:a'").get().n;
+  for (let i = 0; i < 25; i++) {
+    if (i % 10 === 0) clock.t += 3_600_000; // ten checkouts an hour
+    await checkoutId('h1:a');
+  }
+  assert.equal(count(), 25);
+  clock.t += 8 * 86_400_000;
+  await checkoutId('h1:a');
+  assert.equal(count(), 20);
+});
+
+test('received deliveries do not count against the free plan', () => {
+  const { db, b } = standalone();
+  const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
+  for (let i = 0; i < 2; i++) add.run(`own-${i}`, 'h1:a', '{}');
+  for (let i = 0; i < 5; i++) add.run(`got-${i}`, 'h1:a', JSON.stringify({ receivedFrom: `VEIL-${i}` }));
+  // Seven held, two of their own: one more of their own fits under three.
+  assert.equal(b.ceilingPassed('h1:a', 7, 1), 0);
+  assert.equal(b.ceilingPassed('h1:a', 7, 2), 3);
+  add.run('own-2', 'h1:a', '{}');
+  b.noteAdded('h1:a', 1);
+  assert.equal(b.ceilingPassed('h1:a', 8, 1), 3);
+  // Deleting one of their own doesn't give it back.
+  db.prepare("DELETE FROM records WHERE id = 'own-0'").run();
+  assert.equal(b.ceilingPassed('h1:a', 7, 1), 3);
+  // Nothing new is never refused.
+  assert.equal(b.ceilingPassed('h1:a', 8, 0), 0);
+});
+
+test('checkout limits: ten per holder an hour, and fresh keys cannot reset anyone', async () => {
+  const { db, clock, b, checkoutId } = standalone();
+  const add = db.prepare('INSERT INTO records VALUES (?, ?, ?)');
+  add.run('r-a', 'h1:a', '{}');
+  for (let i = 0; i < 10; i++) await checkoutId('h1:a');
+  const out = { code: 200, status(c) { this.code = c; return this; }, json() { return this; } };
+  await b.checkout('h1:a', { plan: 'breeder' }, out);
+  assert.equal(out.code, 429);
+  for (let i = 0; i < 50; i++) {
+    add.run(`r-${i}`, `h1:flood-${i}`, '{}');
+    await checkoutId(`h1:flood-${i}`);
+  }
+  const still = { code: 200, status(c) { this.code = c; return this; }, json() { return this; } };
+  await b.checkout('h1:a', { plan: 'breeder' }, still);
+  assert.equal(still.code, 429, 'still limited this hour');
+  clock.t += 3_600_000;
+  await checkoutId('h1:a');
+});
+
+test('the webhook has its own rate window: a burst from one address is not refused', async () => {
+  const statuses = new Set();
+  for (let i = 0; i < 130; i++) {
+    const res = await fetch(`${base}/api/billing/paddle`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'paddle-signature': 'ts=1;h1=00', 'x-forwarded-for': '10.9.9.9' },
+      body: '{}',
+    });
+    statuses.add(res.status);
+  }
+  assert.deepEqual([...statuses], [401]);
+});
+
+test('a plan and its counts follow the holder key when its stored form moves', () => {
+  const { adoptPlaintextKey, storedHolderKey, legacyStoredHolderKey, HOLDER_KEY_COLUMNS } = require('../holder-key.js');
+  for (const t of ['billing_ids', 'billing_plans', 'billing_grandfathered', 'billing_added']) {
+    assert.ok(HOLDER_KEY_COLUMNS.some(([table, col]) => table === t && col === 'holder_key'), t);
+  }
+  const { db } = standalone();
+  for (const c of ['correction_conflict TEXT', 'first_seen INTEGER', 'updated_at INTEGER']) db.exec(`ALTER TABLE records ADD COLUMN ${c}`);
+  const upper = hex().toUpperCase();
+  const old = legacyStoredHolderKey(upper);
+  db.prepare("INSERT INTO billing_plans VALUES ('sub_01moved0000000001', ?, 'breeder', 'active', NULL, NULL, 1, 1)").run(old);
+  db.prepare('INSERT INTO billing_grandfathered VALUES (?, 9)').run(old);
+  db.prepare('INSERT INTO billing_added VALUES (?, 4)').run(old);
+  db.prepare("INSERT INTO billing_ids VALUES ('d1', ?, 1)").run(old);
+  adoptPlaintextKey(db, upper);
+  const now = storedHolderKey(upper);
+  for (const t of ['billing_ids', 'billing_plans', 'billing_grandfathered', 'billing_added']) {
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE holder_key = ?`).get(now).n, 1, t);
   }
 });
