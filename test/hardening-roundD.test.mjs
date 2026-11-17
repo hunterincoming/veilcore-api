@@ -495,6 +495,9 @@ test('disclosure: a grant goes with its record, and does not pass to whoever sto
   const other = await secretRecord('g-del');
   db.prepare('INSERT INTO disclosure_grants (record_id, holder_key, show, updated_at, grant_values, for_fingerprint) VALUES (?,?,?,?,?,?)')
     .run(rec.id, holder, JSON.stringify(['parent-names']), Date.now(), JSON.stringify({ parents: [{ name: 'Secret Mother' }] }), other.recordFingerprint);
+  // A deleted id can't be stored again (tombstones.js); the rule below still holds for rows from before that.
+  assert.equal((await call('PUT', '/api/records', { holder: H('g-next'), body: [other] })).json.rejected[0].code, 'deleted');
+  db.prepare('DELETE FROM record_tombstones WHERE id = ?').run(rec.id);
   assert.equal((await call('PUT', '/api/records', { holder: H('g-next'), body: [other] })).json.count, 1);
   const v = (await call('GET', `/verify/${rec.id}`)).json;
   assert.deepEqual(v.disclosed, []);

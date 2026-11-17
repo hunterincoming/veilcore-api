@@ -146,6 +146,13 @@ migrateHolderKeys(db);
 // fingerprint-holders.js. Made, and backfilled once, before anything is stored.
 setupFingerprintHolders(db, asStoredKey);
 const firstHolderOf = db.prepare('SELECT holder_key, first_at FROM fingerprint_holders WHERE fingerprint = ?');
+// Ids a holder deleted stay deleted (tombstones.js): no save, dating row or restore brings one back.
+const { setupTombstones } = require('./tombstones.js');
+// How close an anchor and a deletion can be before /verify says their order is unknown: the
+// anchor skew allowed in lineage/batches.mjs (ANCHOR_CLOCK_SKEW_MS) plus the minute deletedAt
+// is rounded to.
+const DELETION_ORDER_WINDOW_MS = 5 * 60_000 + 60_000;
+const tombstones = setupTombstones(db);
 /**
  * The same conversion, on a timer, without the file rebuild (round 2). Rows written in
  * plain text by older code after this one started (a deploy overlap, a rollback) are also
@@ -726,6 +733,9 @@ const featuresServed = () => [
   // key), from the day after that date; POST /license-answers/lookup (review round 3, B2, L1). A
   // site that publishes notices needs this: the unsigned v2 shape is refused.
   'license-notices-v3',
+  // A deleted record stays deleted (tombstones.js): saves and dating rows of its id are refused
+  // with code "deleted", and /verify/:id answers `deleted: true`. The site's delete needs it.
+  'record-tombstones-v1',
   // POST/GET /license-invites (lineage/license-invites.mjs): the mailbox a real two-party
   // license needs between issuer and licensee. A site that makes real licenses needs it.
   ...(licenseInvites ? ['license-invites-v1'] : []),
@@ -1241,6 +1251,7 @@ app.put('/api/records', (req, res) => {
     if (!item || typeof item.id !== 'string' || !item.id) continue;
     const problem = recordRowProblem(item);
     if (problem) rejected.push({ id: item.id.slice(0, 128), reason: problem });
+    else if (tombstones.isDeleted(item.id)) rejected.push(tombstones.refusal(item.id));
     else shaped.push(item);
   }
 
@@ -1290,6 +1301,16 @@ app.put('/api/records', (req, res) => {
     // One entry per id, the last copy sent (round 2): the same id several times in one
     // save was each counted against the stored row, so small copies followed by a big one
     // read as a save that shrank the set, while the big one was what got stored.
+    const priorLinkBody = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
+    const newLinkToDeleted = (id, field, target) => {
+      const gone = tombstones.of(target);
+      if (!gone) return false;
+      if (gone.holder_key !== holder) return true;
+      const prior = priorLinkBody.get(id, holder);
+      if (!prior) return true;
+      const b = JSON.parse(prior.body);
+      return (field === 'supersedes' ? b.supersedes?.recordId : b.supersededBy) !== target;
+    };
     const plan = new Map();
     for (const item of items) {
       // A record may only be marked superseded by a record of the same holder. Ids were
@@ -1301,6 +1322,12 @@ app.put('/api/records', (req, res) => {
           rejected.push({ id: item.id, reason: 'supersededBy names a record that belongs to another holder; nothing was changed' });
           continue;
         }
+        // A deleted id can't become a link target, or a stranger's record could publicly
+        // "correct" it. A link this holder already stored is left as it was.
+        if (!target && newLinkToDeleted(item.id, 'supersededBy', item.supersededBy)) {
+          rejected.push(tombstones.linkRefusal(item.id, 'supersededBy'));
+          continue;
+        }
       }
       // The same for the other direction: a record may only claim to correct a record of
       // its own holder, or the public view would say it corrects someone else's.
@@ -1309,6 +1336,10 @@ app.put('/api/records', (req, res) => {
         const target = holderOfId.get(corrected);
         if (target && target.holder_key !== holder) {
           rejected.push({ id: item.id, reason: 'supersedes names a record that belongs to another holder' });
+          continue;
+        }
+        if (!target && newLinkToDeleted(item.id, 'supersedes', corrected)) {
+          rejected.push(tombstones.linkRefusal(item.id, 'supersedes'));
           continue;
         }
       }
@@ -1579,6 +1610,10 @@ app.put('/api/records/dating', (req, res) => {
       }
       if (seen.has(item.id)) continue;
       seen.add(item.id);
+      if (tombstones.isDeleted(item.id)) {
+        rejected.push(tombstones.refusal(item.id));
+        continue;
+      }
       const owner = holderOfId.get(item.id);
       if (owner && owner.holder_key !== holder) {
         notWritten.push(item.id);
@@ -1635,15 +1670,49 @@ app.delete('/api/records', (req, res) => {
   if (!ids || ids.length === 0) return res.status(400).json({ error: 'expected { ids: [...] }' });
 
   const del = db.prepare('DELETE FROM records WHERE id = ? AND holder_key = ?');
+  const bodyOf = db.prepare('SELECT body FROM records WHERE id = ? AND holder_key = ?');
   const delGrant = db.prepare('DELETE FROM disclosure_grants WHERE record_id = ? AND holder_key = ?');
   const delNotices = db.prepare('DELETE FROM license_notices WHERE record_id = ? AND holder_key = ?');
+  // A record with a live correction would leave that correction naming a deleted record: refused,
+  // as the site does. (Licence lines are the holder's own notices and go with the record; the
+  // licensee's answers stay theirs. Licences themselves are sealed, so only the site can see them.)
+  const correctionsOf = db.prepare(
+    "SELECT id FROM records WHERE holder_key = ? AND json_extract(body, '$.supersedes.recordId') = ?",
+  );
+  // Deleting a correction takes the corrected record's link to it too, so nothing points at a
+  // tombstone (the site's "take back a correction" deletes the correction).
+  const clearLinkTo = db.prepare(
+    `UPDATE records SET body = json_remove(body, '$.supersededBy'), updated_at = ?
+     WHERE id = ? AND holder_key = ? AND json_extract(body, '$.supersededBy') = ?`,
+  );
   const removed = [];
   const notYours = [];
+  const refused = [];
   const tx = db.transaction((list) => {
+    const t = now();
+    const asked = new Set(list);
     for (const id of list) {
-      const info = del.run(id, holder);
+      const row = bodyOf.get(id, holder);
+      if (row) {
+        if (correctionsOf.all(holder, id).some((c) => !asked.has(c.id))) {
+          refused.push({ id, code: 'linked', reason: 'a correction of this record still exists; delete the correction first' });
+          continue;
+        }
+      }
+      const info = row ? del.run(id, holder) : { changes: 0 };
       if (info.changes > 0) {
         removed.push(id);
+        let fp = null;
+        let corrects = null;
+        try {
+          const b = JSON.parse(row.body);
+          fp = b.recordFingerprint ?? null;
+          corrects = typeof b.supersedes?.recordId === 'string' ? b.supersedes.recordId : null;
+        } catch {
+          // A malformed body still gets its tombstone, just without a proof code.
+        }
+        tombstones.mark(id, holder, fp, t);
+        if (corrects) clearLinkTo.run(t, corrects, holder, id);
         delGrant.run(id, holder);
         delNotices.run(id, holder);
       } else notYours.push(id);
@@ -1655,9 +1724,10 @@ app.delete('/api/records', (req, res) => {
   // another holder changes nothing, and saying so beats a count that looks like
   // success.
   res.json({
-    ok: notYours.length === 0,
+    ok: notYours.length === 0 && refused.length === 0,
     removed,
     ...(notYours.length ? { notRemoved: notYours, reason: 'no such record under this holder key' } : {}),
+    ...(refused.length ? { refused } : {}),
   });
 });
 
@@ -2458,7 +2528,47 @@ app.get('/verify/:id', (req, res) => {
   // holder can change or take it back at any time: no cache keeps an older one (12 Nov 2026).
   res.set('Cache-Control', 'no-store');
   const row = db.prepare('SELECT body, holder_key, first_seen FROM records WHERE id = ?').get(req.params.id);
-  if (!row) return res.status(404).json({ found: false });
+  if (!row) {
+    // A deleted record says so, and still says whether it was dated before the deletion: the
+    // anchor is on the ledger whatever happens here. 404, so older check pages read "not found".
+    const gone = tombstones.of(req.params.id);
+    if (!gone) return res.status(404).json({ found: false });
+    const evidence = batches && gone.fingerprint ? batches.evidenceFor(gone.fingerprint) : null;
+    const proof = evidence?.proof ?? null;
+    // The proof code is public (it is what a check link carries), so a page can tie its link
+    // to this record before it reports any date. The time is to the minute: enough to read.
+    const anchoredAt = proof?.anchor ? Date.parse(proof.anchor.anchoredAt) : NaN;
+    // anchoredAt is the operator's report and may be off by the anchor skew, and deletedAt is
+    // given to the minute: inside that window, before or after can't be told.
+    const window = DELETION_ORDER_WINDOW_MS;
+    const sealedAt = evidence?.batch ? Date.parse(evidence.batch.sealedAt) : NaN;
+    return res.status(404).json({
+      found: false,
+      deleted: true,
+      deletedBy: 'record-holder',
+      deletedAt: new Date(Math.floor(gone.deleted_at / 60_000) * 60_000).toISOString(),
+      ...(gone.fingerprint ? { recordFingerprint: gone.fingerprint } : {}),
+      anchored: Boolean(proof && proof.anchor),
+      ...(proof && proof.anchor
+        ? {
+            anchor: proof.anchor,
+            anchorCheckedOnChain: false,
+            // A batch sealed before the deletion can be anchored after it.
+            anchoredRelativeToDeletion: !Number.isFinite(anchoredAt)
+              ? 'unknown'
+              : anchoredAt < gone.deleted_at - window
+                ? 'before'
+                : anchoredAt > gone.deleted_at + window
+                  ? 'after'
+                  : 'unknown',
+          }
+        : {}),
+      // Both times are this registry's own clock, so the order of sealing and deletion is exact.
+      ...(Number.isFinite(sealedAt)
+        ? { sealedRelativeToDeletion: sealedAt < gone.deleted_at ? 'before' : 'after' }
+        : {}),
+    });
+  }
   const r = JSON.parse(row.body);
   const grant = grantFor(row, req.params.id);
   const { on, notGranted, refused } = effectiveDisclosure(grant.show, req.query.show);
