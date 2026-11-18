@@ -46,6 +46,13 @@ deployed.
 | `WRITE_BYTES_PER_DAY` | `209715200` (200 MB) | Daily write allowance per client address. |
 | `WHOLE_SET_READ_BYTES_PER_MINUTE` | `67108864` (64 MB) | Most an address may be sent by unpaged `GET /api/records` / `/api/licenses` in a minute. |
 | `HOLDER_MAX_BYTES` | `41943040` (40 MB) | Most a holder may keep in records, and separately in licences. A save that would grow the set past it is refused (413); one that does not grow it always works. |
+| `BILLING` | unset (off) | `on` switches on paid plans (see "Paid plans"). Off, nothing changes: billing routes answer 404 and every holder keeps up to 10,000 records. |
+| `BILLING_PADDLE_WEBHOOK_SECRET` | unset | The secret of Paddle's notification destination. Set it in Railway only. Missing, billing stays off and the deploy log says why. |
+| `BILLING_FREE_RECORDS` | unset | How many records a holder without a paid plan may keep. |
+| `BILLING_PADDLE_PRICES` | unset | Which Paddle prices are which plan: `pri_…=breeder,pri_…=lab`. A price not listed grants nothing. |
+| `BILLING_PADDLE_API` | unset | `https://sandbox-api.paddle.com` or `https://api.paddle.com`, matching the key. |
+| `BILLING_PADDLE_API_KEY` | unset | Paddle server API key, used only to open checkouts. Railway only. A sandbox key (`_sdbx`) works only with the sandbox API. |
+| `BILLING_PADDLE_CHECKOUT` | unset | The hosted checkout link from Paddle's dashboard (`https://…paddle.io/checkout/hsc_…`). Live accounts need Paddle's approval for hosted checkouts. |
 | `PUBLIC_BASE` | `https://veilcore-api-production.up.railway.app` | Public URL, used by the embed and `/.well-known/veilcore-registry`. |
 | `VEILCORE_ANCHOR_CHAIN` | `midnight` | Chain batch roots are anchored on. |
 | `VEILCORE_ANCHOR_NETWORK` | unset | Network of the anchoring contract: `preview`, `preprod` or `mainnet`. Set together with the next one, or no anchor is recorded. |
@@ -1665,6 +1672,68 @@ ciphertext: no account, no email, no passkey public key.
 
 Limits per client (an IPv6 client by its /48): 20 new copies and 300 saves a UTC day. No
 total cap (the operator watches the database's size). /health lists `passkey-vault-v1`.
+
+## Paid plans (billing.js, switched off by default)
+
+Paddle sells the plans, as merchant of record: it holds the buyer's name, email, address and
+card, and handles sales tax. This registry keeps none of those.
+
+- **No account.** A plan belongs to a holder key, like records. Paddle never sees the key.
+- **No Paddle code on the site.** `POST /api/billing/checkout { plan }` (holder key) makes a
+  billing id (32 random bytes that mean nothing outside this registry), opens a transaction
+  with Paddle's API carrying it as `custom_data.veilcoreBillingId`, and answers the hosted
+  checkout link for that transaction. The site sends the holder to Paddle's own page; the
+  page holding their keys never loads a payment company's script. The billing id is never
+  shown to anyone. The last 20 a holder was given keep working, and none goes before it is 7
+  days old. A checkout needs a record held (409 otherwise). Ten checkouts Paddle opened an hour
+  per holder and twenty per address; attempts (Paddle refusing or down) are limited separately
+  (30 per holder, 60 per address), so an outage doesn't use up anyone's checkouts. Paddle
+  refusing or unreachable: 502.
+- **Webhook.** `POST /api/billing/paddle`, raw body. Counted only with a valid
+  `Paddle-Signature` (`ts=…;h1=…`, HMAC-SHA256 of `ts:body` with the destination's secret, any
+  `h1` during a rotation), a timestamp within 5 minutes, and an event id not seen in 30 days.
+  `subscription.*` events set the holder's plan from the price id (`BILLING_PADDLE_PRICES`),
+  never from a name in the payload. An older event than the one applied changes nothing.
+  An event that can't be applied yet (an unknown billing id or price) is answered 503 and not
+  kept, so Paddle sends it again while the operator fixes it; logged by subscription id only.
+  The webhook has its own rate window (1,200 a minute per address).
+- **The ceiling.** A paid plan keeps up to 10,000 records, while `active` or `trialing`, while
+  `paused` or `canceled` until its period ends plus 7 days, and while `past_due` for 7 days
+  from the first failed renewal (cancelled after a failed renewal: to the end of the period
+  paid for, plus 7 days, never past 7 days from the failure). Otherwise `BILLING_FREE_RECORDS`
+  proof codes dated: the free plan limits dates made, not records kept. Counted per distinct
+  proof code (`billing_counted`, digested), never removed: deleting a record doesn't make room,
+  the same content saved again doesn't count twice, and new content under an old id counts like
+  a new record. Only the rows past a ceiling are refused, each in `rejected` with
+  `code: "plan-limit"`; the rest of the save is stored, so a new record waiting in a browser
+  never blocks an edit that keeps the content. Nothing already held is touched, and records
+  keep verifying.
+- **Switching on.** Each time billing goes from off to on: holders over the free number keep
+  what they hold and may date the free number again, for good (a cap is only raised), and
+  every proof code they hold that counts is counted.
+- **Deliveries.** Claiming one needs free room (413 `plan-limit` otherwise): the recipient
+  seals the received record with their own content, and that date counts. The claimed stub,
+  until it is sealed, holds one slot (`recordsReserved`), so claims can't take more than the
+  plan can date; sealing it uses that slot, and deleting it gives the slot back.
+- **Not counted.** Licences, and a record's one correction as it first arrives (a new id, or one
+  dated first as a bare proof code, correcting the holder's own record that is neither a
+  correction nor received, once per record, ever). A held record turned into a correction, a
+  free correction given new content, a correction of a correction or of a received record, or
+  a correction deleted and made again, counts. The free correction's proof code is kept (marked
+  free), so the same proof code saved again under another id isn't new. A deleted record can't
+  be saved again at all (tombstones), so deleting never makes room.
+- `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordsCounted,
+  recordsReserved, recordCap, plans }`.
+- The billing tables follow a holder key when its stored form moves (`holder-key.js`).
+
+Stored: billing id digests, holder digest, plan, status, period end, Paddle subscription id,
+digests of the proof codes counted on the free plan and of the records whose free correction
+was used, event ids for 30 days.
+
+**A change with billing off too:** at the registry's own ceiling (10,000 records), a save now
+refuses only its new rows (each in `rejected`, status 200) and stores the rest; it used to
+refuse the whole save with a 413. An id held by another holder no longer counts as new, since
+it is never written. Pinned in `test/billing-off.test.mjs`. Tests: `test/billing.test.mjs`, `test/billing-off.test.mjs`.
 
 ## Other limits worth knowing (round D, 4 Oct 2026)
 
