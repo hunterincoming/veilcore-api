@@ -402,9 +402,10 @@ test('on the free plan, deleting a record does not make room for another', async
   assert.deepEqual([p.json.recordsHeld, p.json.recordsCounted, p.json.recordCap], [2, 3, 3]);
   assert.equal((await save(holder)).json.rejected?.[0]?.code, 'plan-limit');
   assert.equal((await date(holder, 1)).json.rejected?.[0]?.code, 'plan-limit');
-  // Saving the deleted record again (a backup) doesn't count it twice.
+  // Saving the deleted record again (a backup) is refused as deleted (tombstones.js), and
+  // counts nothing.
   const back = await saveAll(holder, [records[0]]);
-  assert.equal(back.json.ok, true, JSON.stringify(back.json));
+  assert.deepEqual(back.json.rejected?.map((x) => x.code), ['deleted'], JSON.stringify(back.json));
   assert.equal((await plan(holder)).json.recordsCounted, 3);
 });
 
@@ -616,24 +617,23 @@ test('editing in place: the same content is always saved, new content under the 
   assert.equal((await plan(holder)).json.recordsCounted, 3);
 });
 
-test('deleting and reusing an id: new content counts, the same content does not', async () => {
+test('a deleted id is never reused, so deleting never makes room for new content', async () => {
   const holder = hex();
   const kept = [newRecord(), newRecord()];
   assert.equal((await saveAll(holder, kept)).json.ok, true);
   assert.equal((await call('DELETE', '/api/records', holder, { ids: [kept[0].id] })).status, 200);
-  // New content under the deleted id: the third and last free date.
-  const reused = await saveAll(holder, [{ ...kept[0], recordFingerprint: hex() }]);
-  assert.equal(reused.json.ok, true, JSON.stringify(reused.json));
-  assert.equal((await plan(holder)).json.recordsCounted, 3);
-  assert.equal((await call('DELETE', '/api/records', holder, { ids: [kept[0].id] })).status, 200);
-  // Again with new content: refused, through the save and the dating route alike.
-  const again = { ...kept[0], recordFingerprint: hex() };
-  assert.equal((await saveAll(holder, [again])).json.rejected?.[0]?.code, 'plan-limit');
-  assert.equal(
-    (await call('PUT', '/api/records/dating', holder, [{ id: kept[0].id, recordFingerprint: again.recordFingerprint }])).json
-      .rejected?.[0]?.code,
-    'plan-limit',
+  // New content under the deleted id: refused as deleted, through the save and the dating route alike.
+  const reused = { ...kept[0], recordFingerprint: hex() };
+  assert.deepEqual(
+    (await saveAll(holder, [reused])).json.rejected?.map((x) => x.code),
+    ['deleted'],
   );
+  assert.deepEqual(
+    (await call('PUT', '/api/records/dating', holder, [{ id: kept[0].id, recordFingerprint: reused.recordFingerprint }])).json
+      .rejected?.map((x) => x.code),
+    ['deleted'],
+  );
+  assert.equal((await plan(holder)).json.recordsCounted, 2);
 });
 
 test('a delivery: claiming needs free room, and the content the recipient seals is a date that counts', async () => {
@@ -690,16 +690,16 @@ test('a correction is free only as it first arrives: a held record turned into o
   assert.equal((await plan(holder)).json.recordsCounted, 3);
 });
 
-test('a free correction restored after a delete is not new', async () => {
+test('a free correction, once deleted, can\'t be restored and counts nothing more', async () => {
   const holder = hex();
   const kept = [newRecord(), newRecord(), newRecord()];
   assert.equal((await saveAll(holder, kept)).json.ok, true);
   const fix = correctionOf(kept[0]);
   assert.equal((await saveAll(holder, [{ ...kept[0], supersededBy: fix.id }, fix])).json.ok, true);
   assert.equal((await call('DELETE', '/api/records', holder, { ids: [fix.id] })).status, 200);
-  // The same correction again (a backup): its proof code was kept as free, so it isn't refused.
+  // The same correction again (a backup): refused as deleted, and still not counted.
   const back = await saveAll(holder, [fix]);
-  assert.equal(back.json.rejected, undefined, JSON.stringify(back.json));
+  assert.deepEqual(back.json.rejected?.map((x) => x.code), ['deleted'], JSON.stringify(back.json));
   assert.equal((await plan(holder)).json.recordsCounted, 3);
 });
 

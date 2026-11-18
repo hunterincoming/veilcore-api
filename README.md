@@ -645,6 +645,28 @@ the record), so it tells this registry nothing about what was typed.
 Answer: `{ ok, dated: [ids], rejected?: [{ id, reason }], notWritten?, reason? }`.
 `/health` lists `dating-first-v1`, and the site's deploys require it.
 
+### Deleting: `DELETE /api/records` (17 Nov 2026)
+
+Body `{ "ids": [...] }`, the holder's own ids. Answers `{ ok, removed, notRemoved?, reason?,
+refused? }`: `removed` lists what was actually deleted, so an empty list is a failure. A record
+that a live correction still corrects is refused (`code: "linked"`) unless the correction is in
+the same request. Deleting a correction removes the corrected record's `supersededBy` link to it.
+
+A deleted id stays deleted (`tombstones.js`, table `record_tombstones`). A later save or dating
+row of that id is refused per row with `code: "deleted"`, from any holder: a save already on
+its way, another tab or a restored backup can't bring it back, and nobody can reuse the id. A
+save whose correction link (`supersedes`, `supersededBy`) newly names a deleted id is refused
+with `code: "links-deleted"` and `field`: the row itself is live. A proof code not yet in a
+batch is never batched: a row deleted or changed while a batch is being built is left out and
+the tree built again from the rest (`leftOutWhileSealing`). `GET /verify/:id` answers 404 with
+`{ found: false, deleted: true, deletedBy: "record-holder", deletedAt, recordFingerprint?,
+anchored, anchor?, anchoredRelativeToDeletion?, sealedRelativeToDeletion? }`: `deletedAt` is to
+the minute; the proof code lets a check page tie its link to the record before reporting a
+date. `anchoredRelativeToDeletion` is `before` or `after` only outside the anchor skew plus that
+minute (otherwise `unknown`), since the anchor time is the operator's report;
+`sealedRelativeToDeletion` compares two times on this registry's own clock. `/health` lists
+`record-tombstones-v1`.
+
 ### Obligations (round 3, P5)
 
 `POST /lineage/obligations` `{ record, obligation, beneficiary? }` (holder key) attaches an

@@ -74,6 +74,8 @@ const HOLDER_KEY_COLUMNS = [
   ['billing_grandfathered', 'holder_key'],
   ['billing_counted', 'holder_key'],
   ['billing_free_corrections', 'holder_key'],
+  // Records a holder deleted (tombstones.js).
+  ['record_tombstones', 'holder_key'],
 ];
 
 /** Columns among HOLDER_KEY_COLUMNS that exist in this database. */

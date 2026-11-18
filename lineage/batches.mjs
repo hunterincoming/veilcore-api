@@ -47,6 +47,9 @@ export const describeAnchor = (anchor) => {
  */
 export const ANCHOR_CLOCK_SKEW_MS = 5 * 60_000;
 
+/** Thrown inside a seal's write when a pending record went away while the batch was built. */
+const PENDING_CHANGED = new Error('pending set changed');
+
 /** Stamp retries per batch before the timer stops trying (the operator route still works). */
 const MAX_STAMP_ATTEMPTS = 10;
 
@@ -268,8 +271,9 @@ export const createBatches = (db) => {
       if (sealing) return { error: 'a seal is already in progress; try again shortly', code: 409 };
       sealing = true;
       try {
-        const { ok: rows, skipped } = scanPending();
-        const report = skipped.length ? { skipped } : {};
+        const scan = scanPending();
+        let rows = scan.ok;
+        const report = scan.skipped.length ? { skipped: scan.skipped } : {};
         if (rows.length === 0) return { error: 'nothing pending', ...report };
 
         // An id not already used. It is the day and four random hex digits, so two batches on
@@ -281,7 +285,6 @@ export const createBatches = (db) => {
         let batchId = newBatchId();
         for (let tries = 1; usedId.get(batchId) && tries < 100; tries++) batchId = newBatchId();
         if (usedId.get(batchId)) return { error: 'no unused batch id is left for today; seal again tomorrow', code: 503 };
-        const batch = await buildBatch(rows.map((r) => r.commitment), batchId);
 
         const insertBatch = st(
           'INSERT INTO batches (batch_id, root, sealed_at, record_count, anchor, ots_status) VALUES (?,?,?,?,NULL,?)');
@@ -289,19 +292,40 @@ export const createBatches = (db) => {
         // seal, never a silent overwrite of a proof someone may already hold. That also
         // covers a second registry process sharing this database, which the flag cannot.
         const insertProof = st('INSERT INTO batch_proofs (commitment, batch_id, proof) VALUES (?,?,?)');
-        try {
-          db.transaction(() => {
-            insertBatch.run(batchId, batch.root, Date.now(), rows.length, otsEnabled() ? 'requested' : null);
-            for (const [commitment, proof] of Object.entries(batch.proofs)) {
-              insertProof.run(commitment, batchId, JSON.stringify(proof));
+        // A record deleted (or changed) while the batch was built is not dated: checked again
+        // inside the write. Those rows are left out and the tree built again from the rest, so
+        // the set only shrinks and steady deletes can't keep a seal from finishing.
+        const stillThere = st(`SELECT 1 FROM records WHERE id = ? AND json_extract(body, '$.recordFingerprint') = ?`);
+        let batch;
+        let leftOut = 0;
+        for (;;) {
+          batch = await buildBatch(rows.map((r) => r.commitment), batchId);
+          let gone = [];
+          try {
+            db.transaction(() => {
+              gone = rows.filter((r) => r.id !== 'deal-message' && !stillThere.get(r.id, r.commitment));
+              if (gone.length) throw PENDING_CHANGED;
+              insertBatch.run(batchId, batch.root, Date.now(), rows.length, otsEnabled() ? 'requested' : null);
+              for (const [commitment, proof] of Object.entries(batch.proofs)) {
+                insertProof.run(commitment, batchId, JSON.stringify(proof));
+              }
+            })();
+          } catch (e) {
+            if (e === PENDING_CHANGED) {
+              const out = new Set(gone);
+              rows = rows.filter((r) => !out.has(r));
+              leftOut += gone.length;
+              if (rows.length === 0) return { error: 'nothing pending', ...report };
+              continue;
             }
-          })();
-        } catch (e) {
-          if (String(e?.code ?? '').startsWith('SQLITE_CONSTRAINT')) {
-            return { error: 'the pending set changed while sealing (another seal got there first); nothing was written, seal again', code: 409 };
+            if (String(e?.code ?? '').startsWith('SQLITE_CONSTRAINT')) {
+              return { error: 'the pending set changed while sealing (another seal got there first); nothing was written, seal again', code: 409 };
+            }
+            throw e;
           }
-          throw e;
+          break;
         }
+        if (leftOut) report.leftOutWhileSealing = leftOut;
 
         // A second, independent date on Bitcoin. In the background: a slow calendar must not
         // hold up sealing. A failure is recorded on the batch and retried by the timer.
