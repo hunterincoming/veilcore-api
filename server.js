@@ -779,6 +779,9 @@ const featuresServed = () => [
   ...(deals ? ['deals-v1'] : []),
   ...(paymentReceipts ? ['payment-receipts-v1'] : []),
   ...(passkeyVault ? ['passkey-vault-v1'] : []),
+  // A lab's key on its own website (lineage/lab-domain.mjs): did:web documents read too, and a
+  // key the website stopped listing served as `domainWithdrawn`. A site reads both if present.
+  'lab-domain-withdrawn-v1',
 ];
 app.get('/health', (_req, res) => {
   // licenseChecks: what checking a signed license notice or answer needs (license notices, below).
@@ -3537,7 +3540,7 @@ app.post('/attesters/:publicKey/domain', async (req, res) => {
     return res.status(400).json({ error: 'the key\'s signature over this domain does not verify' });
   }
   const claim = attesters.claimDomain(key, domain, issuedAt);
-  if (claim.error) return res.status(claim.error === 'not registered' ? 404 : 400).json({ error: claim.error });
+  if (claim.error) return res.status(claim.error === 'not registered' ? 404 : claim.code === 'withdrawn' ? 409 : 400).json({ error: claim.error, ...(claim.code ? { code: claim.code, domain: claim.domain } : {}) });
   const last = lastDomainLook.get(key) ?? 0;
   if (Date.now() - last < 10 * 60_000) return res.status(429).json({ error: 'looked less than ten minutes ago; try again later' });
   lastDomainLook.delete(key);
@@ -3551,6 +3554,8 @@ app.post('/attesters/:publicKey/domain', async (req, res) => {
 /** Tests replace the network parts (fetchFile, resolveTxt). */
 let labDomainOptions = {};
 const setLabDomainOptions = (o) => { labDomainOptions = o; };
+/** Tests only: forget the ten-minute limit between looks. */
+const lastDomainLookReset = () => lastDomainLook.clear();
 
 /**
  * Look again at every lab domain whose last look is a day old, eight at a time, each look
@@ -4071,7 +4076,7 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: status === 500 ? 'internal error' : String(err?.message ?? 'bad request') });
 });
 
-module.exports = { app, db, convertPlaintextNow, setLabDomainOptions, relookLabDomains };
+module.exports = { app, db, convertPlaintextNow, setLabDomainOptions, relookLabDomains, lastDomainLookReset };
 
 if (require.main === module) {
   const port = process.env.PORT || 8787;

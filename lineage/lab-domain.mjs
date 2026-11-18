@@ -9,8 +9,14 @@
 //   https://<domain>/.well-known/veilcore-lab.json
 //     { "format": "veilcore-lab/v1", "name": "Acme Labs",
 //       "keys": [ { "publicKey": "<64 hex>" } ] }
+//   or a W3C did:web document at https://<domain>/.well-known/did.json (id "did:web:<domain>"),
+//     the key as a verificationMethod listed under assertionMethod: Multikey or
+//     Ed25519VerificationKey2020 (publicKeyMultibase "z6Mk…"), or JsonWebKey2020 (OKP Ed25519 JWK)
 //   or a DNS TXT record at _veilcore-lab.<domain>:
 //     veilcore-lab=v1 key=<64 hex>
+//
+// A key the website stopped listing, when both the website and DNS answered (not a timeout
+// or an outage), is recorded as withdrawn (attesters.mjs setDomainCheck) and shown as such.
 //
 // Both sides name each other: the key signs the domain (domainClaimPayload) and the domain
 // lists the key. The registry only fetches and records what it saw (domain, how, when, and
@@ -24,6 +30,7 @@ import { request } from 'node:https';
 import { isIP } from 'node:net';
 
 export const LAB_FILE_PATH = '/.well-known/veilcore-lab.json';
+export const DID_FILE_PATH = '/.well-known/did.json';
 export const LAB_TXT_PREFIX = '_veilcore-lab.';
 export const LAB_FILE_MAX = 16 * 1024;
 export const LAB_KEYS_MAX = 64;
@@ -81,6 +88,79 @@ export const readLabTxt = (records, publicKey) =>
     return !!m && m[1] === publicKey;
   });
 
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+/** base58btc (multibase "z"), for Ed25519 public keys in DID documents. */
+export const base58btc = (bytes) => {
+  let n = 0n;
+  for (const b of bytes) n = n * 256n + BigInt(b);
+  let out = '';
+  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of bytes) { if (b !== 0) break; out = '1' + out; }
+  return out;
+};
+const unbase58 = (s) => {
+  let n = 0n;
+  for (const ch of s) {
+    const i = B58.indexOf(ch);
+    if (i < 0) return null;
+    n = n * 58n + BigInt(i);
+  }
+  const out = [];
+  while (n > 0n) { out.unshift(Number(n % 256n)); n /= 256n; }
+  for (const ch of s) { if (ch !== '1') break; out.unshift(0); }
+  return Uint8Array.from(out);
+};
+/** The Ed25519 key as a multibase value (did:key, Multikey): "z" + base58btc(0xed 0x01 + key). */
+export const ed25519Multibase = (publicKeyHex) => 'z' + base58btc(Uint8Array.from([0xed, 0x01, ...Buffer.from(publicKeyHex, 'hex')]));
+
+/** The 64-hex Ed25519 key in a "z6Mk…" multibase value, or undefined. */
+export const ed25519FromMultibase = (v) => {
+  if (typeof v !== 'string' || !v.startsWith('z') || v.length > 60) return undefined;
+  const b = unbase58(v.slice(1));
+  return b && b.length === 34 && b[0] === 0xed && b[1] === 0x01 ? Buffer.from(b.slice(2)).toString('hex') : undefined;
+};
+
+/** A verification method's Ed25519 key as 64 hex, or undefined for anything else. */
+const vmKeyHex = (vm) => {
+  if (typeof vm !== 'object' || vm === null) return undefined;
+  if (vm.type === 'Multikey' || vm.type === 'Ed25519VerificationKey2020') return ed25519FromMultibase(vm.publicKeyMultibase);
+  if (vm.type === 'JsonWebKey2020' || vm.type === 'JsonWebKey') {
+    const j = vm.publicKeyJwk;
+    if (j && j.kty === 'OKP' && j.crv === 'Ed25519' && typeof j.x === 'string' && /^[A-Za-z0-9_-]{43}$/.test(j.x) && j.d === undefined) {
+      return Buffer.from(j.x, 'base64url').toString('hex');
+    }
+  }
+  return undefined;
+};
+
+/**
+ * Whether a did:web document for `domain` lists `publicKey` as a key the DID uses to sign
+ * statements (assertionMethod), the relationship a lab's signature is. The document's id must
+ * be did:web:<domain> (did:web: "the ID of the resolved DID document matches"), and every
+ * method id and controller must be absolute and the DID's own, so a document can't borrow
+ * another DID's key. Returns the method's id too, for the record.
+ */
+export const readDidDoc = (text, publicKey, domain) => {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return { ok: false, why: 'did.json: not JSON' };
+  }
+  const did = `did:web:${domain}`;
+  if (typeof doc !== 'object' || doc === null || doc.id !== did) return { ok: false, why: `did.json: id is not ${did}` };
+  const vms = Array.isArray(doc.verificationMethod) ? doc.verificationMethod : [];
+  const assertion = Array.isArray(doc.assertionMethod) ? doc.assertionMethod : [];
+  if (vms.length + assertion.length > LAB_KEYS_MAX * 2) return { ok: false, why: 'did.json: too many methods' };
+  const own = (vm) => typeof vm?.id === 'string' && vm.id.startsWith(`${did}#`) && (vm.controller === undefined || vm.controller === did);
+  const byId = new Map(vms.filter(own).map((vm) => [vm.id, vm]));
+  for (const a of assertion) {
+    const vm = typeof a === 'string' ? byId.get(a) : own(a) ? a : undefined;
+    if (vm && vmKeyHex(vm) === publicKey) return { ok: true, listed: true, did, keyId: vm.id };
+  }
+  return { ok: true, listed: false, did };
+};
+
 /** Addresses the registry must never connect to: loopback, private, link-local, and the like. */
 export const isPublicAddress = (ip) => {
   const v = isIP(ip);
@@ -120,8 +200,8 @@ const publicLookup = (hostname, options, cb) =>
     cb(null, ok[0].address, ok[0].family);
   });
 
-/** GET https://<domain>/.well-known/veilcore-lab.json: no redirects, 16 KiB, 5 s, public addresses only. */
-export const fetchLabFile = (domain, { lookup = publicLookup, port = 443, ca, deadlineMs = TIMEOUT_MS } = {}) =>
+/** GET https://<domain><path> (the lab file by default): no redirects, 16 KiB, 5 s, public addresses only. */
+export const fetchLabFile = (domain, { lookup = publicLookup, port = 443, ca, deadlineMs = TIMEOUT_MS, path = LAB_FILE_PATH } = {}) =>
   new Promise((resolve) => {
     // One deadline for the whole look, body included: `timeout` alone only fires on silence,
     // so a server sending a byte every few seconds could hold a look for hours (attack, 5 Nov).
@@ -137,11 +217,11 @@ export const fetchLabFile = (domain, { lookup = publicLookup, port = 443, ca, de
       finish({ ok: false, why: 'timed out' });
     }, deadlineMs);
     const req = request(
-      { host: domain, port, path: LAB_FILE_PATH, method: 'GET', lookup, ca, timeout: TIMEOUT_MS, headers: { accept: 'application/json', 'user-agent': 'veilcore-registry' } },
+      { host: domain, port, path, method: 'GET', lookup, ca, timeout: TIMEOUT_MS, headers: { accept: 'application/json', 'user-agent': 'veilcore-registry' } },
       (res) => {
         if (res.statusCode !== 200) {
           res.resume();
-          return finish({ ok: false, why: `HTTP ${res.statusCode}` });
+          return finish({ ok: false, why: `HTTP ${res.statusCode}`, status: res.statusCode });
         }
         const chunks = [];
         let n = 0;
@@ -161,23 +241,54 @@ export const fetchLabFile = (domain, { lookup = publicLookup, port = 443, ca, de
     req.end();
   });
 
+/** An answer that says "not here" (as against a timeout or an outage): a 404 or 410. */
+const goneStatus = (r) => r.status === 404 || r.status === 410;
+/** DNS answers that say there is no such record. */
+const NO_RECORD = new Set(['ENODATA', 'ENOTFOUND']);
+
 /**
- * Look for `publicKey` at `domain`: the file first, then the TXT record. What was seen, not
- * a judgement: { domain, listed, method, checkedAt, fileSha256?, listedName?, why? }.
+ * Look for `publicKey` at `domain`: the lab file, then the did:web document, then the TXT
+ * record. What was seen, not a judgement:
+ *   { domain, listed, method: 'file'|'did'|'dns', checkedAt, fileSha256?, listedName?, did?, didKeyId? }
+ * or, not listed, { domain, listed: false, answered, checkedAt, why }. `answered` is true only
+ * when every place gave a real answer (a file without the key or a 404, and a DNS answer), so
+ * a website that is down or slow is never read as the lab taking its key away.
  */
-export const checkLabDomain = async (domain, publicKey, { fetchFile = fetchLabFile, resolveTxt = (n) => dnsp.resolveTxt(n), now = Date.now } = {}) => {
+export const checkLabDomain = async (
+  domain,
+  publicKey,
+  { fetchFile = fetchLabFile, fetchDid = (d) => fetchFile(d, { path: DID_FILE_PATH }), resolveTxt = (n) => dnsp.resolveTxt(n), now = Date.now } = {},
+) => {
   const d = cleanDomain(domain);
   if (!d) return { error: 'a plain domain name, like acme-labs.com' };
   if (!HEX64.test(publicKey)) return { error: 'a public key' };
   const checkedAt = new Date(now()).toISOString();
   const why = [];
+  let answered = true;
+  const sha = (body) => createHash('sha256').update(body).digest('hex');
+
   const file = await fetchFile(d);
   if (file.ok) {
     const read = readLabFile(file.body.toString('utf8'), publicKey);
-    const fileSha256 = createHash('sha256').update(file.body).digest('hex');
-    if (read.ok && read.listed) return { domain: d, listed: true, method: 'file', checkedAt, fileSha256, ...(read.name ? { listedName: read.name } : {}) };
+    if (read.ok && read.listed) return { domain: d, listed: true, method: 'file', checkedAt, fileSha256: sha(file.body), ...(read.name ? { listedName: read.name } : {}) };
+    if (!read.ok) answered = false;
     why.push(read.ok ? 'the file does not list this key' : read.why);
-  } else why.push(`file: ${file.why}`);
+  } else {
+    if (!goneStatus(file)) answered = false;
+    why.push(`file: ${file.why}`);
+  }
+
+  const didDoc = await fetchDid(d);
+  if (didDoc.ok) {
+    const read = readDidDoc(didDoc.body.toString('utf8'), publicKey, d);
+    if (read.ok && read.listed) return { domain: d, listed: true, method: 'did', checkedAt, fileSha256: sha(didDoc.body), did: read.did, didKeyId: read.keyId };
+    if (!read.ok) answered = false;
+    why.push(read.ok ? 'did.json does not list this key' : read.why);
+  } else {
+    if (!goneStatus(didDoc)) answered = false;
+    why.push(`did.json: ${didDoc.why}`);
+  }
+
   try {
     const txt = await Promise.race([
       resolveTxt(LAB_TXT_PREFIX + d),
@@ -185,8 +296,9 @@ export const checkLabDomain = async (domain, publicKey, { fetchFile = fetchLabFi
     ]);
     if (readLabTxt(txt, publicKey)) return { domain: d, listed: true, method: 'dns', checkedAt };
     why.push('the TXT record does not list this key');
-  } catch {
-    why.push('no TXT record');
+  } catch (e) {
+    if (!NO_RECORD.has(e?.code)) answered = false;
+    why.push(NO_RECORD.has(e?.code) ? 'no TXT record' : 'DNS did not answer');
   }
-  return { domain: d, listed: false, checkedAt, why: why.join('; ') };
+  return { domain: d, listed: false, answered, checkedAt, why: why.join('; ') };
 };

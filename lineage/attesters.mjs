@@ -479,9 +479,36 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
       domain: c.domain, method: c.method, checkedAt: c.checkedAt,
       ...(c.fileSha256 ? { fileSha256: c.fileSha256 } : {}),
       ...(c.listedName ? { listedName: c.listedName } : {}),
+      // did:web (method 'did'): the DID and the verification method that holds the key.
+      ...(c.did ? { did: c.did } : {}),
+      ...(c.didKeyId ? { didKeyId: c.didKeyId } : {}),
       // The key's own signature naming this domain (lab-domain.mjs domainClaimPayload), so
       // anyone can check that direction too, not only the registry.
       ...(c.claimSignature && Number.isSafeInteger(c.claimIssuedAt) ? { claim: { issuedAt: c.claimIssuedAt, signature: c.claimSignature } } : {}),
+    };
+  };
+  /**
+   * The website the key named stopped listing it: a look got a real answer from the website
+   * and DNS (lab-domain.mjs `answered`) after the key had been listed there. Shown with the
+   * key's signed claim, so a page can check the key really named that website. Kept until the
+   * website lists the key again: a lab disowning its key is worth knowing for as long as its
+   * signatures are read.
+   */
+  const publicDomainWithdrawn = (json) => {
+    if (!json) return null;
+    let c;
+    try {
+      c = JSON.parse(json);
+    } catch {
+      return null;
+    }
+    if (c.listed || !c.withdrawnAt || !c.domain || !c.claimSignature || !Number.isSafeInteger(c.claimIssuedAt)) return null;
+    return {
+      domain: c.domain,
+      ...(c.method ? { method: c.method } : {}),
+      withdrawnAt: c.withdrawnAt,
+      checkedAt: c.checkedAt,
+      claim: { issuedAt: c.claimIssuedAt, signature: c.claimSignature },
     };
   };
   /** What the public may read about a key's name check: the record, never a note. */
@@ -530,6 +557,7 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
             nameCheck: pub.nameCheck,
             nameCheckStatus: pub.nameCheckStatus,
             domainCheck: publicDomainCheck(row.domain_check),
+            domainWithdrawn: publicDomainWithdrawn(row.domain_check),
           }
         : null,
       retraction: row.retraction ? signedRetraction(JSON.parse(row.retraction)) : null,
@@ -685,6 +713,7 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
         ...publicNameCheck(r),
         // The lab's own domain lists this key (lab-domain.mjs), as last seen; null otherwise.
         domainCheck: publicDomainCheck(r.domain_check),
+        domainWithdrawn: publicDomainWithdrawn(r.domain_check),
       };
     },
 
@@ -700,6 +729,12 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
       let prev = null;
       try { prev = row.domain_check ? JSON.parse(row.domain_check) : null; } catch { /* unreadable: replaced */ }
       if (prev?.claimIssuedAt && issuedAt <= prev.claimIssuedAt) return { error: 'an older claim than the one on record' };
+      // A key its website stopped listing can't name another website: whoever took a lab's key
+      // could otherwise point it at a lookalike and wipe the lab's withdrawal off every page.
+      // The same website listing it again clears it (lab-domain-keys.md, "Withdrawn").
+      if (prev?.withdrawnAt && !prev.listed && prev.domain && domain !== prev.domain) {
+        return { error: `${prev.domain} stopped listing this key, so it can't name another website; make a new key`, code: 'withdrawn', domain: prev.domain };
+      }
       return { ok: true, prev };
     },
 
@@ -713,14 +748,23 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
       if (!row) return { error: 'not registered' };
       let prev = null;
       try { prev = row.domain_check ? JSON.parse(row.domain_check) : null; } catch { /* replaced */ }
-      const { domain, listed, method, checkedAt, fileSha256, listedName } = result;
+      const { domain, listed, method, checkedAt, fileSha256, listedName, did, didKeyId, answered } = result;
       // A daily look writes only if the lab hasn't named another domain while it looked
       // (second check, 5 Nov 2026: it could put the old domain back).
       if (expectDomain !== undefined && prev?.domain !== expectDomain) return { ok: true, skipped: true };
       const sameDomain = prev?.domain === domain;
       const listedAt = listed ? checkedAt : sameDomain ? prev?.listedAt : undefined;
       const since = sameDomain ? (prev?.since ?? checkedAt) : checkedAt;
-      if (!listed && Date.parse(checkedAt) - Date.parse(listedAt ?? since) > 30 * 86_400_000) {
+      // Withdrawn: listed here before, and now a real "not here" from the website and DNS.
+      // Not a timeout or an outage (`answered` false), and not a domain that never listed it.
+      const withdrawnAt = listed
+        ? undefined
+        : sameDomain && prev?.withdrawnAt
+          ? prev.withdrawnAt
+          : sameDomain && listedAt && answered === true
+            ? checkedAt
+            : undefined;
+      if (!listed && !withdrawnAt && Date.parse(checkedAt) - Date.parse(listedAt ?? since) > 30 * 86_400_000) {
         // Forget the domain but keep the newest claim's time, so an old signed claim can't
         // be replayed afterwards.
         db.prepare('UPDATE attesters SET domain_check = ? WHERE public_key = ?').run(
@@ -731,7 +775,8 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
       }
       db.prepare('UPDATE attesters SET domain_check = ? WHERE public_key = ?').run(
         JSON.stringify({
-          domain, listed: !!listed, method, checkedAt, fileSha256, listedName, listedAt, since,
+          domain, listed: !!listed, method: method ?? (sameDomain ? prev?.method : undefined), checkedAt, fileSha256, listedName,
+          did, didKeyId, listedAt, since, withdrawnAt,
           claimIssuedAt: claimIssuedAt ?? (sameDomain ? prev?.claimIssuedAt : undefined),
           claimSignature: claimSignature ?? (sameDomain ? prev?.claimSignature : undefined),
         }),
