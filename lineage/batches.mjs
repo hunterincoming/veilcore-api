@@ -50,6 +50,9 @@ export const ANCHOR_CLOCK_SKEW_MS = 5 * 60_000;
 /** Thrown inside a seal's write when a pending record went away while the batch was built. */
 const PENDING_CHANGED = new Error('pending set changed');
 
+/** What GET /batches lists for each batch. */
+const LIST_COLS = 'batch_id, root, sealed_at, record_count, anchor, ots_status, ots_error, ots_bitcoin_height, ots_bitcoin_time, ots IS NOT NULL AS has_ots';
+
 /** Stamp retries per batch before the timer stops trying (the operator route still works). */
 const MAX_STAMP_ATTEMPTS = 10;
 
@@ -654,10 +657,33 @@ export const createBatches = (db) => {
       return { byId, batches };
     },
 
-    list() {
+    /**
+     * Every batch, newest first. With `limit`, one page of them (public mirror, 18 Nov 2026):
+     * `before` is the batchId the previous page ended on, and the next page starts after it in
+     * the same order (sealed_at, then batch_id, both descending). A cursor, not an offset, so a
+     * batch sealed while a mirror is paging lands on the first page and never shifts a later
+     * one. Returns { batches, next } with `next` null on the last page, or `{ error }` for a
+     * `before` that names no batch. Without `limit`, the whole list as before.
+     */
+    list({ limit, before } = {}) {
+      if (limit === undefined) return this.rows(st(`SELECT ${LIST_COLS} FROM batches ORDER BY sealed_at DESC, batch_id DESC`).all());
+      let rows;
+      if (before === undefined) {
+        rows = st(`SELECT ${LIST_COLS} FROM batches ORDER BY sealed_at DESC, batch_id DESC LIMIT ?`).all(limit + 1);
+      } else {
+        const at = st('SELECT sealed_at FROM batches WHERE batch_id = ?').get(before);
+        if (!at) return { error: 'before names no batch' };
+        rows = st(`SELECT ${LIST_COLS} FROM batches WHERE sealed_at < ? OR (sealed_at = ? AND batch_id < ?)
+                   ORDER BY sealed_at DESC, batch_id DESC LIMIT ?`).all(at.sealed_at, at.sealed_at, before, limit + 1);
+      }
+      const more = rows.length > limit;
+      const page = this.rows(more ? rows.slice(0, limit) : rows);
+      return { batches: page, next: more ? page[page.length - 1].batch_id : null };
+    },
+
+    rows(listRows) {
       const superseded = new Set(st('SELECT DISTINCT batch_id FROM batch_anchor_history').all().map((r) => r.batch_id));
-      return st(`SELECT batch_id, root, sealed_at, record_count, anchor, ots_status, ots_error, ots_bitcoin_height, ots_bitcoin_time, ots IS NOT NULL AS has_ots
-                 FROM batches ORDER BY sealed_at DESC`).all()
+      return listRows
         .map(({ has_ots: hasOts, ots_status: s, ots_error: err, ots_bitcoin_height: h, ots_bitcoin_time: t, ...b }) => ({
           ...b,
           anchor: b.anchor ? describeAnchor(JSON.parse(b.anchor)) : null,

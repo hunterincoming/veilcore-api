@@ -1,0 +1,103 @@
+# The public mirror of VeilCore's dated batches, run by GitHub on a schedule.
+#
+# This file is a template kept in veilcore-api. It does nothing here. To set it up:
+#   1. Create a public GitHub repository (e.g. veilcore-archive) with "Add a README file".
+#   2. In it, Add file -> Create new file, name it .github/workflows/mirror.yml, paste this
+#      file, and commit.
+#   3. Actions tab -> Mirror -> Run workflow. A data/ folder appears with one folder per batch.
+# GitHub pauses schedules in a public repository after 60 days without a commit; if no batch
+# has changed for that long, re-enable it in the Actions tab.
+#
+# Every six hours it copies every batch from the registry into data/ (scripts/mirror), checks
+# them with no VeilCore server, and commits whatever changed. The git history is a second
+# witness: a dated, public record of what the registry served and when. If the registry ever
+# serves a different history (a root, an anchor, a token or a proof changed or gone), the
+# mirror keeps both versions, this commits them, and the run fails, so GitHub emails the
+# repository owner.
+#
+# Secrets: none beyond GitHub's own token. BLOCKFROST_PROJECT_ID is optional: without it the
+# Midnight check says "couldn't check" and nothing fails.
+#
+# Once a week it also asks Software Heritage to archive the repository ("save code now"),
+# an independent copy outside GitHub. That step may fail without failing the run.
+name: Mirror
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # every six hours
+    - cron: '41 4 * * 0'     # Sunday: fetch every file again, and ask Software Heritage
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # to commit data/ to this repository; nothing else
+    steps:
+      - name: Check out this archive
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  #v6.0.3
+        with:
+          path: archive
+
+      # The mirror and checker. An outside witness should pin a commit here instead of main.
+      - name: Check out the mirror scripts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  #v6.0.3
+        with:
+          repository: hunterincoming/veilcore-api
+          ref: main
+          path: tool
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  #v6.4.0
+        with:
+          node-version: '24'
+
+      # No npm install: the scripts use Node's own modules only.
+      - name: Mirror the registry
+        id: mirror
+        env:
+          FULL: ${{ github.event.schedule == '41 4 * * 0' && '--full' || '' }}
+        run: |
+          set +e
+          node tool/scripts/mirror/witness.mjs mirror archive/data $FULL 2>&1 | tee mirror.log
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Check every batch, with no VeilCore server
+        id: check
+        env:
+          BLOCKFROST_PROJECT_ID: ${{ secrets.BLOCKFROST_PROJECT_ID }}
+        run: |
+          set +e
+          node tool/scripts/mirror/witness.mjs check archive/data > check.log 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          { echo '## Mirror'; echo '```'; cat mirror.log; echo '```'; echo '## Check'; echo '```'; cat check.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # Committed even when the mirror found a conflict: the other version is the evidence.
+      - name: Commit what changed
+        working-directory: archive
+        run: |
+          git add data
+          if git diff --cached --quiet; then echo "nothing changed"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Mirror $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q
+
+      - name: Ask Software Heritage to archive this repository
+        if: github.event.schedule == '41 4 * * 0' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: curl -fsS -X POST "https://archive.softwareheritage.org/api/1/origin/save/git/url/https://github.com/${GITHUB_REPOSITORY}/"
+
+      - name: Fail loudly if the registry changed history or a check found a mismatch
+        if: steps.mirror.outputs.code != '0' || steps.check.outputs.code != '0'
+        run: |
+          echo "mirror exit ${{ steps.mirror.outputs.code }}, check exit ${{ steps.check.outputs.code }}"
+          echo "See the run summary, and data/conflicts/ in this repository."
+          exit 1
