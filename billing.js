@@ -207,8 +207,9 @@ const createBilling = (
   const config = billingConfig(env, hardCap);
   if (!config.enabled && (env.BILLING ?? '') !== '') console.error(`billing stays off: ${config.reason}`);
 
-  // A free correction's proof code is kept too (free = 1), so restoring it after a delete isn't new;
-  // it doesn't count against the plan. Added in place on a database from before.
+  // A free correction's proof code is kept too (free = 1), so the same proof code saved again
+  // under another id isn't new; it doesn't count against the plan. Added in place on a
+  // database from before.
   if (!db.prepare("SELECT 1 FROM pragma_table_info('billing_counted') WHERE name = 'free'").get()) {
     db.exec('ALTER TABLE billing_counted ADD COLUMN free INTEGER NOT NULL DEFAULT 0');
   }
@@ -350,8 +351,8 @@ const createBilling = (
   const correctionIsFree = (holder, target) => !config.enabled || !freeUsed.get(holder, idDigest(target));
   /**
    * The free correction of this record was used, with this proof code (call inside the
-   * transaction that stored it). The proof code is kept, marked free, so the same correction
-   * restored after a delete isn't new.
+   * transaction that stored it). The proof code is kept, marked free, so the same proof code
+   * saved again under another id isn't new.
    */
   const noteFreeCorrection = (holder, target, fp) => {
     if (!config.enabled) return;
@@ -360,11 +361,6 @@ const createBilling = (
       dropCounted.run(holder, fpDigest(fp));
       addFree.run(holder, fpDigest(fp));
     }
-  };
-
-  /** A proof code counted when only it was dated, now stored as a free correction. */
-  const uncount = (holder, fp) => {
-    if (config.enabled && typeof fp === 'string') dropCounted.run(holder, fpDigest(fp));
   };
 
   const pruneIds = db.prepare(
@@ -504,6 +500,10 @@ const createBilling = (
     // A plan is for keeping records: a key that holds none has nothing to pay for yet, and
     // random keys can't open transactions in Paddle on VeilCore's account.
     if (!holdsARecord.get(holder)) return res.status(409).json({ error: 'save a record first; a plan is for the records you keep' });
+    // Already paying (or due): a second checkout would be a second subscription. A cancelled
+    // plan still in its paid period may start a new one.
+    const current = currentPlan(holder);
+    if (current && current.status !== 'canceled') return res.status(409).json({ error: 'this key already has a plan' });
     const hour = Math.floor(now() / 3_600_000);
     if (hour !== checkoutHour) {
       checkoutHour = hour;
@@ -572,7 +572,6 @@ const createBilling = (
     planRoom,
     wasCounted,
     noteAdded,
-    uncount,
     correctionIsFree,
     noteFreeCorrection,
     webhook,

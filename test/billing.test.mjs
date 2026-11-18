@@ -731,3 +731,51 @@ test('a claimed stub holds a slot until sealed: one slot left takes one claim, a
   const p = await plan(recipient);
   assert.deepEqual([p.json.recordsCounted, p.json.recordsReserved], [3, 0]);
 });
+
+test('a delivery claimed while paid can still be sealed after the plan lapses', async () => {
+  const sender = hex();
+  const src = newRecord();
+  assert.equal((await saveAll(sender, [src])).json.ok, true);
+  const offer = async () => {
+    const sealedOffer = sealOfferForTest(offerFromRecord(src), randomBytes(32), src.id, src.recordFingerprint);
+    const o = await call('POST', '/transfers', sender, { sourceRecord: src.id, toHandle: handleTagFor(hex(), 'lab@x'), sealedOffer });
+    assert.equal(o.status, 200, JSON.stringify(o.json));
+    return o.json;
+  };
+  const recipient = hex();
+  const bid = await billingId(recipient);
+  const sub = subId();
+  await send(event('subscription.created', { billingId: bid, sub }));
+  assert.equal((await date(recipient, 3)).json.dated?.length, 3);
+  // Paid: two claims, both allowed.
+  const stubs = [];
+  for (let i = 0; i < 2; i++) {
+    const o = await offer();
+    const c = await call('POST', `/transfers/${o.transferId}/claim`, recipient, { claimCode: o.claimCode });
+    assert.equal(c.status, 200, JSON.stringify(c.json));
+    stubs.push(c.json.recordId ?? c.json.receivedRecordId ?? c.json.id);
+  }
+  // The plan lapses: back to the free number, well under what is held.
+  const ended = new Date(Date.now() - GRACE_MS - 86_400_000).toISOString();
+  await send(event('subscription.canceled', { sub, status: 'canceled', endsAt: ended }));
+  assert.equal((await plan(recipient)).json.plan, 'free');
+  assert.equal((await date(recipient, 1)).json.rejected?.[0]?.code, 'plan-limit');
+  // Both received records can still be sealed: stopping payment never strands one.
+  for (const id of stubs) {
+    const sealed = await saveAll(recipient, [{ id, recordFingerprint: hex(), nonce: hex(), strainName: 'Got' }]);
+    assert.equal(sealed.json.ok, true, JSON.stringify(sealed.json));
+  }
+  // New records are still refused.
+  assert.equal((await save(recipient)).json.rejected?.[0]?.code, 'plan-limit');
+});
+
+test('a checkout while a plan is paid is refused; after a cancel it is allowed', async () => {
+  const holder = hex();
+  const bid = await billingId(holder);
+  const sub = subId();
+  await send(event('subscription.created', { billingId: bid, sub }));
+  const again = await checkout(holder);
+  assert.equal(again.status, 409, JSON.stringify(again.json));
+  await send(event('subscription.canceled', { sub, status: 'canceled' }));
+  assert.equal((await checkout(holder)).status, 200);
+});

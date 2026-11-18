@@ -1720,7 +1720,8 @@ card, and handles sales tax. This registry keeps none of those.
   correction nor received, once per record, ever). A held record turned into a correction, a
   free correction given new content, a correction of a correction or of a received record, or
   a correction deleted and made again, counts. The free correction's proof code is kept (marked
-  free), so the same correction restored after a delete isn't new.
+  free), so the same proof code saved again under another id isn't new. A deleted record can't
+  be saved again at all (tombstones), so deleting never makes room.
 - `GET /api/billing/plan` (holder key): `{ plan, status, periodEnd, recordsHeld, recordsCounted,
   recordsReserved, recordCap, plans }`.
 - The billing tables follow a holder key when its stored form moves (`holder-key.js`).

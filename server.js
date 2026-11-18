@@ -1494,9 +1494,12 @@ app.put('/api/records', (req, res) => {
       const changed = fp !== undefined && (!mine || !r.prior || fp !== fpOf(r.prior.body));
       const counts =
         changed && !freeCorrections.has(id) && !countingFps.has(fp) && !billing.wasCounted(holder, fp);
-      // Sealing a received record's stub uses the slot the claim reserved for it.
-      if (counts && mine && r.prior && isReceivedStub(JSON.parse(r.prior.body))) room.room++;
-      const cap = !mine && hardRoom <= 0 ? MAX_PER_HOLDER : counts && room.room <= 0 ? room.cap : 0;
+      // Sealing a received record's stub uses the slot the claim reserved for it, and is never
+      // refused for the plan: the claim was allowed (or came before billing), and a plan that
+      // lapsed since must not leave a received record that can never be sealed.
+      const sealsStub = counts && mine && r.prior && isReceivedStub(JSON.parse(r.prior.body));
+      if (sealsStub) room.room++;
+      const cap = !mine && hardRoom <= 0 ? MAX_PER_HOLDER : counts && !sealsStub && room.room <= 0 ? room.cap : 0;
       if (cap) {
         plan.delete(id);
         rejected.push(capRowRefusal(id, cap));
