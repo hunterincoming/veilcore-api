@@ -5,6 +5,9 @@
 //       Copy every batch from the registry into <folder>, append-only. Exit 2, with the
 //       other version kept in <folder>/conflicts/, if the registry now serves a history
 //       that does not extend the copy (a root, anchor, token or proof changed or gone).
+//       Exit 1 if the run could not finish (registry unreachable; an answer it can't use,
+//       such as a batch listed twice differently or a page cursor that goes nowhere): the
+//       folder is then left exactly as it was.
 //
 //   node scripts/mirror/witness.mjs check <folder> [--indexer URL]... [--tsa-ca FILE]
 //       [--bitcoin-explorer URL]... [--offline] [--json FILE]
@@ -20,6 +23,12 @@ import { fileURLToPath } from 'node:url';
 import { mirror } from './mirror.mjs';
 import { check, OK, MISMATCH } from './check.mjs';
 import { DEFAULT_EXPLORER } from '../../lineage/ots.mjs';
+import { printable } from './common.mjs';
+
+// Everything printed goes through printable(): registry text never reaches a terminal or a
+// GitHub run log with a control character in it (no `::` workflow command, no fence).
+const out = (line) => console.log(printable(line, 2000));
+const err = (line) => console.error(printable(line, 2000));
 
 export const DEFAULT_REGISTRY = 'https://veilcore-api-production.up.railway.app';
 
@@ -61,18 +70,19 @@ const label = (s) => LABEL[s] ?? "COULDN'T CHECK";
 
 const main = async () => {
   let o;
-  try { o = parse(process.argv.slice(2)); } catch (e) { console.error(`${e.message}\n${usage}`); return 1; }
+  try { o = parse(process.argv.slice(2)); } catch (e) { err(e.message); console.error(usage); return 1; }
   const folder = resolve(o.folder);
 
   if (o.cmd === 'mirror') {
-    const s = await mirror({ api: o.registry ?? DEFAULT_REGISTRY, out: folder, full: o.full, log: (m) => console.error(m) });
-    console.log(`${s.batches} batches listed by ${s.registry}: ${s.added.length} new, ${s.updated.length} updated, ${s.unchanged} unchanged.`);
-    for (const u of s.updated) console.log(`  updated ${u.batchId}: ${u.what.join('; ')}`);
-    for (const n of s.notes) console.log(`  note: ${n}`);
+    const s = await mirror({ api: o.registry ?? DEFAULT_REGISTRY, out: folder, full: o.full, log: err });
+    out(`${s.batches} batches listed by ${s.registry}: ${s.added.length} new, ${s.updated.length} updated, ${s.unchanged} unchanged.`);
+    for (const u of s.updated) out(`  updated ${u.batchId}: ${u.what.join('; ')}`);
+    for (const n of s.notes) out(`  note: ${n}`);
     if (s.conflicts.length) {
-      console.error(`\n!!! THE REGISTRY CHANGED HISTORY: ${s.conflicts.length} batch(es) no longer match the mirror. !!!`);
-      for (const c of s.conflicts) console.error(`  ${c.batchId}: ${c.reasons.join('; ')} -> ${c.keptIn}`);
-      console.error('The mirror keeps its copy unchanged; what the registry served now is kept beside it. Nothing was overwritten.');
+      err('');
+      err(`!!! THE REGISTRY CHANGED HISTORY: ${s.conflicts.length} batch(es) no longer match the mirror. !!!`);
+      for (const c of s.conflicts) err(`  ${c.batchId}: ${c.reasons.join('; ')} -> ${c.keptIn}`);
+      err('The mirror keeps its copy unchanged; what the registry served now is kept beside it. Nothing was overwritten.');
       return 2;
     }
     return 0;
@@ -86,11 +96,12 @@ const main = async () => {
   const count = { [OK]: 0, [MISMATCH]: 0, other: 0 };
   for (const r of report.results) {
     count[r.overall in count ? r.overall : 'other']++;
-    console.log(`${r.batchId}  ${label(r.overall)}`);
-    for (const [part, v] of Object.entries(r.parts)) console.log(`    ${part.padEnd(9)} ${label(v.status)}: ${v.detail}`);
+    out(`${r.batchId}  ${label(r.overall)}`);
+    for (const [part, v] of Object.entries(r.parts)) out(`    ${part.padEnd(9)} ${label(v.status)}: ${v.detail}`);
   }
-  for (const d of report.stray) console.log(`note: batches/${d} is not in index.json`);
-  console.log(`\n${report.results.length} batches: ${count[OK]} OK, ${count[MISMATCH]} mismatch, ${count.other} not fully checked.`);
+  for (const d of report.stray) out(`note: batches/${d} is not in index.json`);
+  out('');
+  out(`${report.results.length} batches: ${count[OK]} OK, ${count[MISMATCH]} mismatch, ${count.other} not fully checked; ${report.stray.length} stray folder(s).`);
   if (o.json) writeFileSync(o.json, `${JSON.stringify(report, null, 2)}\n`);
   return count[MISMATCH] ? 2 : 0;
 };
@@ -99,4 +110,4 @@ const main = async () => {
 // resolves symlinks for the module it runs, so comparing with argv[1] as typed would do
 // nothing, silently, when the script is reached through a link.
 const isMain = () => { try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } };
-if (isMain()) main().then((code) => { process.exitCode = code; }, (e) => { console.error(`error: ${e.message}`); process.exitCode = 1; });
+if (isMain()) main().then((code) => { process.exitCode = code; }, (e) => { err(`error: ${e.message}`); process.exitCode = 1; });

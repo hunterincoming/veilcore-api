@@ -30,6 +30,8 @@ export const UNCHECKED = "couldn't check";
 const verdict = (status, detail) => ({ status, detail });
 /** An anchor's time may be off from the chain's block by this much before it is called a mismatch. */
 const SKEW_MS = 5 * 60_000;
+/** Bitcoin lets a block's time run up to two hours ahead of the network's. */
+const BTC_SKEW_MS = 2 * 3_600_000;
 
 // ── RFC 3161 ────────────────────────────────────────────────────────────────────────────
 
@@ -53,12 +55,13 @@ export const checkTsa = async ({ dir, rec, tsaCa, openssl = 'openssl', sdk }) =>
   if (sdk) {
     let v;
     try { v = await sdk(new Uint8Array(tst), new Uint8Array(root)); } catch (e) { v = { ok: false, checks: [{ ok: false, what: e.message }] }; }
-    if (!v.ok) {
-      const failed = (v.checks ?? []).filter((c) => !c.ok).map((c) => c.what).join('; ');
-      return verdict(MISMATCH, `the token does not verify against root.bin: ${failed || 'no reason given'}`);
-    }
+    const failed = (v.checks ?? []).filter((c) => !c.ok).map((c) => c.what);
+    // A token that carries no signer certificate can only be checked with --tsa-ca (openssl
+    // below); the SDK alone can't say whose it is, which is not a mismatch.
+    const onlyNoCert = failed.length === 1 && /signer certificate is present/.test(failed[0]);
+    if (!v.ok && !onlyNoCert) return verdict(MISMATCH, `the token does not verify against root.bin: ${failed.join('; ') || 'no reason given'}`);
     genTime = v.genTime;
-    notes.push('SDK: imprint and signature OK');
+    if (v.ok) notes.push('SDK: imprint and signature OK');
   }
   if (!hasOpenssl(openssl)) {
     if (!sdk) return verdict(UNCHECKED, 'neither openssl nor the SDK (npm install) is available');
@@ -78,9 +81,10 @@ export const checkTsa = async ({ dir, rec, tsaCa, openssl = 'openssl', sdk }) =>
       trust = ['-CAfile', tsaCa];
     } else {
       // The certificates the token carries, trusted as given: checks imprint and signature only.
-      try {
-        writeFileSync(join(tmp, 'own.pem'), run(['pkcs7', '-inform', 'DER', '-in', join(dir, 'root.tst'), '-print_certs']));
-      } catch { return verdict(MISMATCH, 'root.tst carries no certificates openssl can read'); }
+      let own = '';
+      try { own = run(['pkcs7', '-inform', 'DER', '-in', join(dir, 'root.tst'), '-print_certs']); } catch { /* none readable */ }
+      if (!own.includes('BEGIN CERTIFICATE')) return verdict(UNCHECKED, 'the token carries no certificate, so its signature can only be checked with the TSA\'s certificate: give --tsa-ca');
+      writeFileSync(join(tmp, 'own.pem'), own);
       trust = ['-CAfile', join(tmp, 'own.pem'), '-partial_chain'];
     }
     try {
@@ -122,18 +126,26 @@ export const checkOts = async ({ dir, rec, explorers, fetchImpl }) => {
     return verdict(MISMATCH, `the registry says Bitcoin block ${claimed}; the proof names ${heights.join(', ')}`);
   }
   if (explorers.length === 0) return verdict(UNCHECKED, `proof parses and names Bitcoin block ${heights.join(', ')}; blocks not looked up (offline). Full check: \`ots verify\` with your own Bitcoin node`);
+  // Every attestation with every explorer. One explorer down never hides another's mismatch:
+  // a mismatch anywhere wins, and "couldn't check" only when nothing was wrong.
   const times = [];
+  const mismatches = [];
+  const unreached = [];
   for (const a of btc) {
     for (const explorer of explorers) {
       try {
-        const r = await checkBitcoinBlock(a.height, a.msg, { explorer, fetchImpl });
-        times.push(r);
+        times.push(await checkBitcoinBlock(a.height, a.msg, { explorer, fetchImpl }));
       } catch (e) {
-        if (e.mismatch) return verdict(MISMATCH, `Bitcoin block ${a.height}'s header does not hold the Merkle root this proof claims`);
-        return verdict(UNCHECKED, `proof parses; could not get block ${a.height} from ${new URL(explorer).host} (${e.message})`);
+        if (e.mismatch) mismatches.push(`Bitcoin block ${a.height}'s header from ${new URL(explorer).host} does not hold the Merkle root this proof claims`);
+        else unreached.push(`block ${a.height} from ${new URL(explorer).host} (${e.message})`);
       }
     }
   }
+  if (mismatches.length) return verdict(MISMATCH, mismatches.join('; '));
+  // Bitcoin block times can be up to two hours off; a block well before sealing cannot hold this root.
+  const early = times.find((t) => Date.parse(t.time) < Date.parse(rec.sealedAt) - BTC_SKEW_MS);
+  if (early) return verdict(MISMATCH, `Bitcoin block ${early.height} is dated ${early.time}, before the batch was sealed (${rec.sealedAt})`);
+  if (unreached.length) return verdict(UNCHECKED, `proof parses; could not get ${unreached.join('; ')}`);
   const first = times.sort((x, y) => x.height - y.height)[0];
   return verdict(OK, `in Bitcoin block ${first.height} at ${first.time} (header from ${explorers.map((e) => new URL(e).host).join(' and ')}; full check: \`ots verify\` with your own node)`);
 };
@@ -205,7 +217,7 @@ const askIndexer = async (indexer, { txId, contract, root, rootOf }, fetchImpl) 
   for (const t of list(body.data.byHash)) if (norm(t.hash) === txId) add(t);
   for (const t of list(body.data.byId)) if (Array.isArray(t.identifiers) && t.identifiers.map(norm).includes(txId) && HEX64.test(norm(t.hash))) add(t);
   if (conflicting) return { kind: 'refused', reason: 'the indexer gave two different answers for that transaction' };
-  if (found.size === 0) return { kind: 'refused', reason: `${hostOf(indexer)} has no transaction ${txId.slice(0, 12)}…` };
+  if (found.size === 0) return { kind: 'absent', reason: `${hostOf(indexer)} has no transaction ${txId.slice(0, 12)}…` };
   if (found.size > 1) return { kind: 'refused', reason: 'more than one transaction answers to that id' };
   const [[txHash, tx]] = [...found];
   if (tx.transactionResult?.status !== 'SUCCESS') return { kind: 'refused', reason: 'that transaction did not succeed' };
@@ -237,6 +249,13 @@ export const checkMidnight = async ({ rec, indexers, contract = MAINNET_CONTRACT
   for (const i of indexers) answers.push(await askIndexer(i, { txId, contract, root: rec.root, rootOf }, fetchImpl));
   const refused = answers.find((x) => x.kind === 'refused');
   if (refused) return verdict(MISMATCH, refused.reason);
+  // One indexer without the transaction may only be behind, or on another network. Two or
+  // more, every one of them without it, is a second source confirming it isn't there.
+  const absent = answers.filter((x) => x.kind === 'absent');
+  if (absent.length && absent.length === answers.length && answers.length >= 2) {
+    return verdict(MISMATCH, `none of the ${answers.length} indexers has transaction ${txId.slice(0, 12)}…`);
+  }
+  if (absent.length) return verdict(UNCHECKED, `${absent[0].reason}: it may be behind, or on another network; a second indexer that also lacks it would make this a mismatch`);
   const down = answers.find((x) => x.kind === 'unreachable');
   if (down) return verdict(UNCHECKED, down.reason);
   const [first, ...rest] = answers;
@@ -245,11 +264,13 @@ export const checkMidnight = async ({ rec, indexers, contract = MAINNET_CONTRACT
     return verdict(MISMATCH, `the registry recorded block ${a.blockHeight}; Midnight says block ${first.height}`);
   }
   const at = new Date(first.time).toISOString();
+  if (first.time < Date.parse(rec.sealedAt) - SKEW_MS) return verdict(MISMATCH, `block ${first.height} is dated ${at}, before the batch was sealed (${rec.sealedAt})`);
+  const how = rootOf ? 'the contract cell holds this root' : 'root bytes found in contract state (cell not decoded)';
   // The block is the date. The registry's anchoredAt is the operator's word (a batch anchored
   // by hand may carry the time it was recorded), so a difference is noted, not a mismatch.
   const off = a.anchoredAt && Math.abs(Date.parse(a.anchoredAt) - first.time) > SKEW_MS
     ? `; note: the registry shows ${a.anchoredAt}, the block's time is the date` : '';
-  return verdict(OK, `written by transaction ${txId.slice(0, 12)}… in block ${first.height} at ${at} (${answers.length} indexer${answers.length > 1 ? 's' : ''})${off}`);
+  return verdict(OK, `written by transaction ${txId.slice(0, 12)}… in block ${first.height} at ${at}; ${how} (${answers.length} indexer${answers.length > 1 ? 's' : ''})${off}`);
 };
 
 // ── the whole mirror ────────────────────────────────────────────────────────────────────
@@ -289,9 +310,17 @@ export const check = async (root, opts = {}) => {
     const overall = all.includes(MISMATCH) ? MISMATCH : all.every((s) => s === OK) ? OK : UNCHECKED;
     results.push({ batchId: entry.batchId, sealedAt: rec.sealedAt, overall, parts });
   }
-  // Folders the index doesn't name: the mirror was edited by hand, or a run died half way.
+  // A conflicts/ folder for a batch the index doesn't list: the registry served a new batch
+  // that contradicted itself on first sight, so it was never added. That is a mismatch too.
   const named = new Set(index.batches.map((b) => b.batchId));
+  const conflicts = existsSync(join(root, 'conflicts')) ? readdirSync(join(root, 'conflicts')).sort() : [];
+  for (const id of conflicts.filter((c) => !named.has(c))) {
+    const kept = readdirSync(join(root, 'conflicts', id)).sort().map((d) => `conflicts/${id}/${d}`);
+    const why = verdict(MISMATCH, `never added: the registry served it in a form that contradicts itself (${kept.join(', ')})`);
+    const none = verdict(UNCHECKED, 'not in the mirror');
+    results.push({ batchId: id, overall: MISMATCH, parts: { files: why, rfc3161: none, bitcoin: none, midnight: none } });
+  }
+  // Folders the index doesn't name: the mirror was edited by hand.
   const stray = existsSync(join(root, 'batches')) ? readdirSync(join(root, 'batches')).filter((d) => !named.has(d)) : [];
-  const conflicts = existsSync(join(root, 'conflicts')) ? readdirSync(join(root, 'conflicts')) : [];
   return { registry: index.registry, results, stray, conflicts };
 };

@@ -1840,14 +1840,19 @@ node scripts/mirror/witness.mjs check  <folder>   # check every batch, no VeilCo
 
 **mirror** writes one folder per batch (`batches/<batchId>/`: `batch.json`, `root.bin`,
 `root.bin.ots`, `root.tst`), `registry.json` (the `/.well-known` answer) and `index.json`
-(every batch with each file's SHA-256). It never overwrites what it has. Normal changes are
+(every batch with each file's SHA-256). A run works on a copy and swaps it in only when it
+finishes, so a run that dies half way (exit 1) leaves the folder as it was. Each run fetches
+the files again and compares them, all of them up to 200 batches and a quarter per run past
+that (`--full` for all). It never overwrites what it has. Normal changes are
 taken: a first anchor; a test-network anchor followed by a mainnet one the registry keeps in
 `earlierAnchors`; a token where there was none; a `.ots` that keeps every operation and
 Bitcoin attestation of the old one and adds to it (pending → Bitcoin). Anything else (a root,
 sealing time, record count, mainnet anchor or token changed; a file or batch gone; a proof
 that loses a Bitcoin attestation) is a conflict: the copy stays, what the registry served is
 kept in `conflicts/<batchId>/`, and the command exits 2 with a loud message. A batch once in
-conflict stays marked in `index.json`.
+conflict stays marked in `index.json`. Every field the registry sends is checked before it is kept or
+printed (hashes as 64 hex, names as short plain names, dates as dates); a batch that fails is
+filed as a conflict and never added, and `check` reports it as a mismatch.
 
 **check** reports each batch's files, RFC 3161 token, Bitcoin proof and Midnight anchor as
 OK, MISMATCH or COULDN'T CHECK, with the reason, and exits 2 on any mismatch.

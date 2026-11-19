@@ -11,14 +11,14 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { untilReady } from './helpers.mjs';
 import { parseOtsFile, otsFile, serialiseTimestamp, rootDigest } from '../lineage/ots.mjs';
-import { mirror, listAll } from '../scripts/mirror/mirror.mjs';
+import { mirror, listAll, RECHECK_ALL, RECHECK_SLICES } from '../scripts/mirror/mirror.mjs';
 import { check, checkTsa, checkOts, checkMidnight, stateHoldsRoot, OK, MISMATCH, UNCHECKED } from '../scripts/mirror/check.mjs';
-import { compareRecords, otsChange, MAINNET_CONTRACT } from '../scripts/mirror/common.mjs';
+import { compareRecords, otsChange, batchRecord, printable, MAINNET_CONTRACT } from '../scripts/mirror/common.mjs';
 import { indexersFrom } from '../scripts/mirror/witness.mjs';
 
 process.env.DB_PATH = ':memory:';
@@ -57,6 +57,7 @@ const seed = (e, { id = e.row.batch_id, ots = e.ots, status = e.row.opentimestam
     tst ? Buffer.from(tst, 'base64') : null);
 };
 const set = (id, col, v) => db.prepare(`UPDATE batches SET ${col} = ? WHERE batch_id = ?`).run(v, id);
+const sha256hex = (b) => createHash('sha256').update(b).digest('hex');
 const files = (d) => readdirSync(d, { recursive: true }).filter((f) => statSync(join(d, f)).isFile()).sort();
 
 /** The same proof with every Bitcoin attestation (and the path to it) taken out: what it was while pending. */
@@ -100,7 +101,7 @@ test('the mirror pages through every batch, and a registry that ignores paging s
   for (const [i, id] of ['B-1', 'B-2', 'B-3'].entries()) seed(PENDING, { id, sealedAt: Date.UTC(2026, 10, 1) + i });
   const asked = [];
   const spy = (u, i) => { asked.push(new URL(u).search); return fetch(u, i); };
-  assert.deepEqual((await listAll(base, { fetchImpl: spy, pageSize: 1 })).map((b) => b.batchId), ['B-3', 'B-2', 'B-1']);
+  assert.deepEqual((await listAll(base, { fetchImpl: spy, pageSize: 1 })).map((e) => e.rec.batchId), ['B-3', 'B-2', 'B-1']);
   assert.deepEqual(asked, ['?limit=1', '?limit=1&before=B-3', '?limit=1&before=B-2']);
 
   const rows = (await (await fetch(`${base}/batches`)).json()).batches;
@@ -132,10 +133,12 @@ test('a first run copies every batch; a second changes nothing on disk', async (
   assert.deepEqual(index.batches.map((x) => x.batchId), [BTC.row.batch_id, PENDING.row.batch_id], 'oldest first, so new batches append');
   assert.equal(index.batches[0].files['root.bin.ots'], createHash('sha256').update(btcOts).digest('hex'));
 
-  const before = Object.fromEntries(files(out).map((f) => [f, statSync(join(out, f)).mtimeMs]));
+  // A run works on a copy and swaps it in, keeping times to the millisecond.
+  const state = () => Object.fromEntries(files(out).map((f) => [f, [Math.floor(statSync(join(out, f)).mtimeMs), sha256hex(readFileSync(join(out, f)))]]));
+  const before = state();
   const again = await mirror({ api: base, out, full: true });
   assert.equal(again.unchanged, 2);
-  assert.deepEqual(Object.fromEntries(files(out).map((f) => [f, statSync(join(out, f)).mtimeMs])), before, 'nothing rewritten');
+  assert.deepEqual(state(), before, 'nothing rewritten');
 });
 
 test('pending -> Bitcoin is a normal update, told apart by the new proof keeping everything the old one proved', async () => {
@@ -155,10 +158,13 @@ test('pending -> Bitcoin is a normal update, told apart by the new proof keeping
   assert.deepEqual(s.updated[0].what, ['OpenTimestamps status pending -> bitcoin', 'root.bin.ots upgraded', 'root.tst added']);
   assert.ok(readFileSync(f).equals(btcOts));
 
-  // Once on Bitcoin, an ordinary run no longer asks for it; a full run does.
+  // Final now, but still fetched again and compared on an ordinary run (RECHECK_ALL), so a
+  // swapped token or proof is caught without waiting for a full run.
   const asked = [];
   await mirror({ api: base, out, fetchImpl: (u, i) => { asked.push(new URL(u).pathname); return fetch(u, i); } });
-  assert.ok(!asked.some((p) => p.endsWith('.ots') || p.endsWith('.tst') || p.endsWith('.bin')), asked.join());
+  for (const f of ['root.bin', 'root.bin.ots', 'root.tst']) assert.ok(asked.some((p) => p.endsWith(f)), f);
+  set(BTC.row.batch_id, 'tsa_token', Buffer.from('3000', 'hex'));
+  assert.match((await mirror({ api: base, out })).conflicts[0].reasons.join(), /root\.tst changed/, 'caught without --full');
 });
 
 /** Mirror, change the registry with `rewrite`, mirror again: the second run must refuse. */
@@ -413,4 +419,141 @@ test('the whole mirror: OK only when every part is; a tampered file or a kept co
   writeFileSync(join(d, 'index.json'), JSON.stringify(idx));
   r = await check(d, opts);
   assert.match(r.results[1].parts.files.detail, /once served a different version/);
+});
+
+// ---- review fixes (18 Nov 2026) ----
+
+test('a run that dies half way leaves the mirror exactly as it was, and check finds nothing wrong', async () => {
+  clear(); seed(BTC); seed(PENDING, { tst: null });
+  const out = tmp('mirror-');
+  await mirror({ api: base, out });
+  const snapshot = Object.fromEntries(files(out).map((f) => [f, readFileSync(join(out, f))]));
+  set(PENDING.row.batch_id, 'tsa_token', Buffer.from(BTC.tst, 'base64')); // would be "added"...
+  const dying = (u, i) => (u.includes(`${BTC.row.batch_id}/root.tst`) ? new Response('x', { status: 502 }) : fetch(u, i));
+  await assert.rejects(mirror({ api: base, out, fetchImpl: dying }), (e) => e.message.includes(`${base}/batches/${BTC.row.batch_id}/root.tst answered 502`));
+  assert.deepEqual(files(out), Object.keys(snapshot));
+  for (const [f, b] of Object.entries(snapshot)) assert.ok(readFileSync(join(out, f)).equals(b), f);
+  assert.deepEqual(readdirSync(join(out, '..')).filter((d) => d.startsWith(`${basename(out)}.`)), [], 'no work folder left');
+  const r = await check(out, { explorers: [], sdk: null });
+  assert.ok(!r.results.some((x) => x.overall === MISMATCH));
+  await assert.rejects(mirror({ api: base, out, fetchImpl: async () => { throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); } }), /veilcore-registry: ECONNREFUSED/);
+});
+
+test('a new batch that contradicts itself is a mismatch in check (exit 2), never silently skipped', async () => {
+  clear(); seed(BTC);
+  const out = tmp('mirror-');
+  const lying = (u, i) => (u.endsWith(`${BTC.row.batch_id}/root.bin`) ? new Response(Buffer.alloc(32, 0xbb)) : fetch(u, i));
+  const s = await mirror({ api: base, out, fetchImpl: lying });
+  assert.equal(s.added.length, 0);
+  const r = await check(out, { explorers: [], sdk: null });
+  const bad = r.results.find((x) => x.batchId === BTC.row.batch_id);
+  assert.equal(bad.overall, MISMATCH);
+  assert.match(bad.parts.files.detail, /never added/);
+  const cli = await new Promise((res) => execFile(process.execPath, [WITNESS, 'check', out, '--offline'], (err, stdout) => res({ code: err?.code ?? 0, stdout })));
+  assert.equal(cli.code, 2);
+});
+
+test('registry text is checked before it is kept, and nothing printed can start a workflow command', async () => {
+  const evil = { ...BTC.row, batch_id: 'B-EVIL', anchor: { ...BTC.row.anchor, network: 'mainnet\n::error title=x::History rewritten\n```' } };
+  assert.throws(() => batchRecord(evil), /network is not a short plain name/);
+  for (const [k, v, why] of [['txHash', 'zz'.repeat(32), /txHash/], ['contractAddress', 'AB'.repeat(32), /contractAddress/], ['blockHeight', '5', /blockHeight/], ['anchoredAt', 'yesterday', /anchoredAt/]]) {
+    assert.throws(() => batchRecord({ ...BTC.row, anchor: { ...BTC.row.anchor, [k]: v } }), why);
+  }
+  // A malformed batch from the registry is filed as a conflict, and the run says so (exit 2).
+  clear(); seed(BTC);
+  db.prepare('UPDATE batches SET anchor = ? WHERE batch_id = ?').run(JSON.stringify({ ...stored(BTC.row.anchor), network: 'mainnet\n::error::x' }), BTC.row.batch_id);
+  const out = tmp('mirror-');
+  const cli = await new Promise((res) => execFile(process.execPath, [WITNESS, 'mirror', out, '--registry', base], (err, stdout, stderr) => res({ code: err?.code ?? 0, all: stdout + stderr })));
+  assert.equal(cli.code, 2);
+  assert.match(cli.all, /does not check: .*network is not a short plain name/);
+  assert.ok(!cli.all.split('\n').some((l) => l.startsWith('::')), 'no line starts a workflow command');
+  assert.equal(printable('a\n::error::b\u001b[2J c'), 'a?::error::b?[2J?c');
+});
+
+test('anchors compare field by field: an added field is ignored, the same instant written two ways is equal, a change is named', () => {
+  const rec = batchRecord(BTC.row);
+  assert.deepEqual(compareRecords(rec, { ...BTC.row, anchor: { ...BTC.row.anchor, somethingNew: 1, anchoredAt: BTC.row.anchor.anchoredAt.replace('.000Z', 'Z') } }), { conflicts: [], updates: [] });
+  assert.deepEqual(compareRecords(rec, { ...BTC.row, anchor: { ...BTC.row.anchor, blockHeight: 1 } }).conflicts, [`the anchor changed: blockHeight ${BTC.row.anchor.blockHeight} -> 1`]);
+  assert.equal(batchRecord({ ...BTC.row, sealed_at: new Date(BTC.row.sealed_at).toISOString() }).sealedAt, rec.sealedAt);
+});
+
+test('past RECHECK_ALL batches, each run fetches final files again for one slice in turn', async () => {
+  const n = RECHECK_ALL + 1;
+  const rows = Array.from({ length: n }, (_, i) => ({ batch_id: `B-${String(i).padStart(4, '0')}`, root: createHash('sha256').update(String(i)).digest('hex'), sealed_at: Date.UTC(2026, 0, 1) + i, record_count: 1, anchor: null, opentimestamps: { status: 'none' } }));
+  const byId = new Map(rows.map((r) => [r.batch_id, r]));
+  let asked = [];
+  const reg = async (u) => {
+    const p = new URL(u).pathname;
+    if (p === '/.well-known/veilcore-registry') return new Response('{}');
+    if (p === '/batches') return new Response(JSON.stringify({ batches: rows }));
+    asked.push(p);
+    const m = /^\/batches\/([^/]+)\/root\.bin$/.exec(p);
+    return m ? new Response(Buffer.from(byId.get(m[1]).root, 'hex')) : new Response('', { status: 404 });
+  };
+  const out = tmp('mirror-');
+  await mirror({ api: 'https://registry.test', out, fetchImpl: reg });
+  const seen = new Set();
+  for (let slot = 0; slot < RECHECK_SLICES; slot++) {
+    asked = [];
+    await mirror({ api: 'https://registry.test', out, fetchImpl: reg, now: new Date(slot * 6 * 3_600_000) });
+    const bins = asked.filter((p) => p.endsWith('root.bin'));
+    assert.ok(bins.length >= Math.floor(n / RECHECK_SLICES) && bins.length <= Math.ceil(n / RECHECK_SLICES), String(bins.length));
+    for (const b of bins) seen.add(b);
+  }
+  assert.equal(seen.size, n, 'every batch rechecked within one round of slices');
+});
+
+test('Bitcoin: every explorer is asked; one down never hides another\'s mismatch; a block before sealing is a mismatch', async () => {
+  const d = await fresh();
+  const dir = join(d, 'batches', BTC.row.batch_id);
+  const rec = JSON.parse(readFileSync(join(dir, 'batch.json')));
+  const good = explorer(976480, btcMerkle());
+  const liar = explorer(976480, Buffer.alloc(32, 7));
+  const down = explorer(1, btcMerkle(), { down: true });
+  const two = (a, b) => async (u) => (u.startsWith('https://a.test') ? a(u) : b(u));
+  const E2 = ['https://a.test/api', 'https://b.test/api'];
+  const v = await checkOts({ dir, rec, explorers: E2, fetchImpl: two(down, liar) });
+  assert.equal(v.status, MISMATCH, v.detail);
+  assert.match(v.detail, /from b\.test/);
+  assert.equal((await checkOts({ dir, rec, explorers: E2, fetchImpl: two(down, good) })).status, UNCHECKED);
+  assert.equal((await checkOts({ dir, rec, explorers: E2, fetchImpl: two(good, good) })).status, OK);
+  const late = await checkOts({ dir, rec: { ...rec, sealedAt: '2026-11-19T00:00:00.000Z' }, explorers: E2, fetchImpl: two(good, good) });
+  assert.equal(late.status, MISMATCH);
+  assert.match(late.detail, /before the batch was sealed/);
+});
+
+test('Midnight: one indexer without the transaction is couldn\'t check; two without it is a mismatch; OK says how the root was found', async () => {
+  const none = async () => new Response(JSON.stringify({ data: { byHash: [], byId: [] } }));
+  assert.equal((await mid(anchored(), none)).status, UNCHECKED);
+  assert.match((await mid(anchored(), none)).detail, /may be behind, or on another network/);
+  assert.equal((await mid(anchored(), none, ['https://a.test', 'https://b.test'])).status, MISMATCH);
+  const mixed = async (u, i) => (u.includes('a.test') ? none() : indexer()(u, i));
+  assert.equal((await mid(anchored(), mixed, ['https://a.test', 'https://b.test'])).status, UNCHECKED);
+  assert.match((await mid(anchored(), indexer())).detail, /root bytes found in contract state \(cell not decoded\)/);
+  const exact = await checkMidnight({ rec: anchored(), indexers: ['https://i.test'], fetchImpl: indexer(), rootOf: () => A.root });
+  assert.match(exact.detail, /the contract cell holds this root/);
+  const early = await mid({ ...anchored(), sealedAt: '2026-11-19T00:00:00.000Z' }, indexer());
+  assert.equal(early.status, MISMATCH);
+  assert.match(early.detail, /before the batch was sealed/);
+});
+
+test('RFC 3161: a token that carries no certificate is couldn\'t check without --tsa-ca, not a mismatch', async () => {
+  const w = tmp('nocert-');
+  const ssl = (...a) => execFileSync('openssl', a, { cwd: w, stdio: ['ignore', 'pipe', 'pipe'] });
+  writeFileSync(join(w, 'ext.cnf'), 'extendedKeyUsage = critical,timeStamping\nbasicConstraints = CA:FALSE\n');
+  ssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'ca.key', '-out', 'ca.pem', '-days', '2', '-subj', '/CN=Root');
+  ssl('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'tsa.key', '-out', 'tsa.csr', '-subj', '/CN=TSA');
+  ssl('x509', '-req', '-in', 'tsa.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'tsa.pem', '-days', '2', '-extfile', 'ext.cnf');
+  writeFileSync(join(w, 'tsa.cnf'), `[ tsa ]\ndefault_tsa = t\n[ t ]\nserial = ${w}/serial\nsigner_cert = ${w}/tsa.pem\nsigner_key = ${w}/tsa.key\nsigner_digest = sha256\ndefault_policy = 1.2.3.4.1\ndigests = sha256\ness_cert_id_alg = sha256\nordering = no\ntsa_name = no\ness_cert_id_chain = no\n`);
+  writeFileSync(join(w, 'serial'), '01\n');
+  writeFileSync(join(w, 'root.bin'), Buffer.from(root, 'hex'));
+  ssl('ts', '-query', '-data', 'root.bin', '-sha256', '-no_nonce', '-out', 'q.tsq'); // no -cert: the token carries none
+  ssl('ts', '-reply', '-config', 'tsa.cnf', '-queryfile', 'q.tsq', '-out', 'r.tsr');
+  ssl('ts', '-reply', '-in', 'r.tsr', '-token_out', '-out', 'root.tst');
+  const rec = { root, sealedAt: '2026-01-01T00:00:00.000Z' };
+  for (const sdk of [SDK, null]) {
+    const v = await checkTsa({ dir: w, rec, sdk });
+    assert.equal(v.status, UNCHECKED, v.detail);
+    assert.match(v.detail, /carries no certificate/);
+  }
 });

@@ -7,8 +7,8 @@
 // batch. See docs/run-a-witness.md.
 // SPDX-License-Identifier: Apache-2.0
 
-import { existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { parseOtsFile, attestationsOf, rootDigest } from '../../lineage/ots.mjs';
 import {
   FORMAT, FILES, BATCH_ID, sha256, stableJson, writeAtomic, writeIfChanged, readJson, readIf, batchDir,
@@ -20,23 +20,38 @@ export const PAGE = 200;
 /** Most any one answer may be, so a broken or hostile registry cannot fill the disk. */
 const CAP = { list: 32 << 20, json: 1 << 20, 'root.bin': 64, 'root.bin.ots': 1 << 20, 'root.tst': 1 << 20 };
 const MAX_PAGES = 10_000;
+/**
+ * Files that can no longer change (a token, a proof already on Bitcoin, root.bin) are still
+ * fetched again and compared, so a swapped one is caught: every run while there are at most
+ * RECHECK_ALL batches, and past that a quarter of them per run, in turn (each one about once a
+ * day at four runs a day). `--full` fetches all of them.
+ */
+export const RECHECK_ALL = 200;
+export const RECHECK_SLICES = 4;
+const SLOT_MS = 6 * 3_600_000;
 
 const isLocal = (u) => ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname);
 
-/** GET with a size cap, a timeout and no redirects. Returns { status, body } (404 allowed). */
+/** GET with a size cap, a timeout and no redirects. Returns { status, body } (404 allowed). Errors name the URL and why. */
 export const get = async (url, { cap, fetchImpl = fetch, timeoutMs = 30_000 }) => {
   const u = new URL(url);
-  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && isLocal(u))) throw new Error('only https registries are mirrored');
-  const r = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'veilcore-mirror' } });
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && isLocal(u))) throw new Error(`${url}: only https registries are mirrored`);
+  let r;
+  try {
+    r = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'veilcore-mirror' } });
+  } catch (e) {
+    const why = e?.name === 'TimeoutError' ? 'timed out' : e?.cause?.code ?? e?.cause?.message ?? e?.message ?? 'no answer';
+    throw new Error(`${url}: ${why}`);
+  }
   if (r.status === 404) { await r.body?.cancel?.().catch?.(() => {}); return { status: 404, body: Buffer.alloc(0) }; }
-  if (!r.ok) throw new Error(`${u.pathname} answered ${r.status}`);
+  if (!r.ok) throw new Error(`${url} answered ${r.status}`);
   const declared = Number(r.headers?.get?.('content-length'));
-  if (declared > cap) throw new Error(`${u.pathname} is larger than expected`);
+  if (declared > cap) throw new Error(`${url} is larger than expected`);
   const chunks = [];
   let total = 0;
   for await (const c of r.body ?? []) {
     total += c.length;
-    if (total > cap) throw new Error(`${u.pathname} is larger than expected`);
+    if (total > cap) throw new Error(`${url} is larger than expected`);
     chunks.push(Buffer.from(c));
   }
   return { status: r.status, body: Buffer.concat(chunks) };
@@ -44,14 +59,17 @@ export const get = async (url, { cap, fetchImpl = fetch, timeoutMs = 30_000 }) =
 
 const getJson = async (url, opts) => {
   const { status, body } = await get(url, opts);
-  if (status === 404) throw new Error(`${new URL(url).pathname} is not there (404)`);
-  try { return JSON.parse(body.toString('utf8')); } catch { throw new Error(`${new URL(url).pathname} is not JSON`); }
+  if (status === 404) throw new Error(`${url} is not there (404)`);
+  try { return JSON.parse(body.toString('utf8')); } catch { throw new Error(`${url} is not JSON`); }
 };
 
 /**
- * Every batch the registry lists. Asks for pages (`?limit=` and `?before=`, `next` in the
- * answer); a registry from before paging ignores both and sends every batch with no `next`,
- * which ends the loop the same way. A batch listed twice must be listed the same both times.
+ * Every batch the registry lists, as [{ rec } | { bad: { batchId, reason, row } }]. Asks for
+ * pages (`?limit=` and `?before=`, `next` in the answer); a registry from before paging
+ * ignores both and sends every batch with no `next`, which ends the loop the same way. A
+ * batch listed twice must be listed the same both times. A listed batch that fails
+ * batchRecord comes back as `bad` (the run files it as a conflict); one without a usable id,
+ * a broken cursor or a batch listed twice differently fails the whole run.
  */
 export const listAll = async (api, { fetchImpl, pageSize = PAGE } = {}) => {
   const seen = new Map();
@@ -59,19 +77,22 @@ export const listAll = async (api, { fetchImpl, pageSize = PAGE } = {}) => {
   for (let page = 0; page < MAX_PAGES; page++) {
     const q = new URLSearchParams({ limit: String(pageSize), ...(before ? { before } : {}) });
     const body = await getJson(`${api}/batches?${q}`, { cap: CAP.list, fetchImpl });
-    if (!body || !Array.isArray(body.batches)) throw new Error('/batches did not list batches');
+    if (!body || !Array.isArray(body.batches)) throw new Error(`${api}/batches did not list batches`);
     for (const row of body.batches) {
-      const rec = batchRecord(row);
-      const prev = seen.get(rec.batchId);
-      if (prev && stableJson(prev) !== stableJson(rec)) throw new Error(`the registry listed ${rec.batchId} twice, differently`);
-      seen.set(rec.batchId, rec);
+      const id = row?.batch_id ?? row?.batchId;
+      if (typeof id !== 'string' || !BATCH_ID.test(id)) throw new Error(`${api}/batches listed a batch with no usable batch id`);
+      let entry;
+      try { entry = { rec: batchRecord(row) }; } catch (e) { entry = { bad: { batchId: id, reason: e.message, row } }; }
+      const prev = seen.get(id);
+      if (prev && stableJson(prev) !== stableJson(entry)) throw new Error(`the registry listed ${id} twice, differently`);
+      seen.set(id, entry);
     }
     const next = body.next;
     if (next === undefined || next === null) return [...seen.values()];
-    if (typeof next !== 'string' || !BATCH_ID.test(next) || next === before) throw new Error('/batches gave a page cursor that goes nowhere');
+    if (typeof next !== 'string' || !BATCH_ID.test(next) || next === before) throw new Error(`${api}/batches gave a page cursor that goes nowhere`);
     before = next;
   }
-  throw new Error(`/batches still had more after ${MAX_PAGES} pages`);
+  throw new Error(`${api}/batches still had more after ${MAX_PAGES} pages`);
 };
 
 const order = (a, b) => (a.sealedAt < b.sealedAt ? -1 : a.sealedAt > b.sealedAt ? 1 : a.batchId < b.batchId ? -1 : a.batchId > b.batchId ? 1 : 0);
@@ -93,17 +114,61 @@ const keepConflict = (root, id, files, reasons, now) => {
 };
 
 /**
+ * A run works on a copy of the mirror beside it (<out>.work-<pid>) and swaps it in only when
+ * it finishes, so a run that dies half way (a 502, a timeout) leaves the mirror exactly as
+ * it was: never batch files newer than the index that lists them. A run that died between the
+ * two renames of the swap left <out>.old-<pid>; the next run puts it back first.
+ */
+const startWork = (out) => {
+  const parent = dirname(out);
+  const name = basename(out);
+  mkdirSync(parent, { recursive: true });
+  if (!existsSync(out)) {
+    const old = readdirSync(parent).find((d) => d.startsWith(`${name}.old-`));
+    if (old) renameSync(join(parent, old), out);
+  }
+  for (const d of readdirSync(parent)) {
+    if (d.startsWith(`${name}.work-`) || d.startsWith(`${name}.old-`)) rmSync(join(parent, d), { recursive: true, force: true });
+  }
+  const work = join(parent, `${name}.work-${process.pid}`);
+  if (existsSync(out)) cpSync(out, work, { recursive: true, preserveTimestamps: true });
+  else mkdirSync(work);
+  return work;
+};
+const finishWork = (out, work) => {
+  const old = join(dirname(out), `${basename(out)}.old-${process.pid}`);
+  if (existsSync(out)) renameSync(out, old);
+  renameSync(work, out);
+  rmSync(old, { recursive: true, force: true });
+};
+
+/**
  * One run. Returns a summary; `conflicts` non-empty means the registry served a history that
- * does not extend the mirror's (the caller exits 2). Nothing already in the mirror is ever
- * overwritten except by a normal update: a first anchor, a test-network anchor followed by a
- * mainnet one, a proof that only gains (pending -> Bitcoin), a token where there was none.
+ * does not extend the mirror's (the caller exits 2). Throws when the run cannot finish (the
+ * registry unreachable, an answer it can't use); then the mirror is left exactly as it was.
+ * Nothing already in the mirror is ever overwritten except by a normal update: a first
+ * anchor, a test-network anchor followed by a mainnet one, a proof that only gains
+ * (pending -> Bitcoin), a token where there was none.
  *
- * `full` fetches every file of every batch again. Otherwise a batch's files are fetched only
- * while they can still change: root.bin once, root.bin.ots until it holds a Bitcoin
- * attestation, root.tst until there is one.
+ * Files are fetched while they can still change (root.bin.ots until it holds a Bitcoin
+ * attestation, root.tst until there is one) and, to catch a swapped one, also when they
+ * can't (see RECHECK_ALL); `full` fetches every file of every batch.
  */
 export const mirror = async ({ api, out, fetchImpl = fetch, full = false, now = new Date(), log = () => {} }) => {
   api = api.replace(/\/+$/, '');
+  const work = startWork(out);
+  let summary;
+  try {
+    summary = await run({ api, out: work, fetchImpl, full, now, log });
+  } catch (e) {
+    rmSync(work, { recursive: true, force: true });
+    throw e;
+  }
+  finishWork(out, work);
+  return summary;
+};
+
+const run = async ({ api, out, fetchImpl, full, now, log }) => {
   const summary = { registry: api, batches: 0, added: [], updated: [], unchanged: 0, conflicts: [], missingFromRegistry: [], notes: [] };
 
   const wellKnown = await getJson(`${api}/.well-known/veilcore-registry`, { cap: CAP.json, fetchImpl });
@@ -116,8 +181,26 @@ export const mirror = async ({ api, out, fetchImpl = fetch, full = false, now = 
   const oldIndex = existsSync(join(out, 'index.json')) ? readJson(join(out, 'index.json')) : { batches: [] };
   const known = new Map((oldIndex.batches ?? []).map((b) => [b.batchId, b]));
   const index = new Map(known);
+  const slot = Math.floor(now.getTime() / SLOT_MS) % RECHECK_SLICES;
+  const recheckAll = full || listed.length <= RECHECK_ALL;
 
-  for (const rec of listed) {
+  const conflict = (id, files, reasons, had) => {
+    const where = keepConflict(out, id, files, reasons, now);
+    summary.conflicts.push({ batchId: id, reasons, keptIn: where });
+    log(`CONFLICT ${id}: ${reasons.join('; ')} (what the registry served is kept in ${where}; the mirror's copy is unchanged)`);
+    // A batch in conflict is left exactly as it was, normal updates included, until a person
+    // has looked; the index notes where the other version is. A new batch that already
+    // contradicts itself is not added (check reports its conflicts/ folder).
+    if (had) index.set(id, { ...had, conflicts: [...new Set([...(had.conflicts ?? []), where])].sort() });
+  };
+
+  for (const [position, entry] of listed.entries()) {
+    if (entry.bad) {
+      const { batchId: id, reason, row } = entry.bad;
+      conflict(id, { 'listed.json': Buffer.from(stableJson(row)) }, [`the registry listed it in a form that does not check: ${reason}`], known.get(id));
+      continue;
+    }
+    const rec = entry.rec;
     const id = rec.batchId;
     const dir = batchDir(out, id);
     const had = known.get(id);
@@ -132,11 +215,12 @@ export const mirror = async ({ api, out, fetchImpl = fetch, full = false, now = 
     }
 
     // Which files to ask for this run.
+    const recheck = recheckAll || position % RECHECK_SLICES === slot;
     const want = new Set();
-    if (full || !oldFiles['root.bin']) want.add('root.bin');
+    if (recheck || !oldFiles['root.bin']) want.add('root.bin');
     const otsIsFinal = oldFiles['root.bin.ots'] && otsHasBitcoin(rec.root, oldFiles['root.bin.ots']);
-    if (full || (!otsIsFinal && (rec.opentimestamps.status !== 'none' || oldFiles['root.bin.ots']))) want.add('root.bin.ots');
-    if (full || !oldFiles['root.tst']) want.add('root.tst');
+    if (recheck || (!otsIsFinal && (rec.opentimestamps.status !== 'none' || oldFiles['root.bin.ots']))) want.add('root.bin.ots');
+    if (recheck || !oldFiles['root.tst']) want.add('root.tst');
 
     const fetched = {};
     for (const f of want) {
@@ -171,27 +255,21 @@ export const mirror = async ({ api, out, fetchImpl = fetch, full = false, now = 
     if (conflicts.length) {
       const served = { 'batch.json': Buffer.from(stableJson(rec)) };
       for (const [f, b] of Object.entries(fetched)) if (b) served[f] = b;
-      const where = keepConflict(out, id, served, conflicts, now);
-      summary.conflicts.push({ batchId: id, reasons: conflicts, keptIn: where });
-      log(`CONFLICT ${id}: ${conflicts.join('; ')} (what the registry served is kept in ${where}; the mirror's copy is unchanged)`);
-      if (!old) continue; // a new batch that already contradicts itself is not added
-      // A batch in conflict is left exactly as it was, normal updates included, until a
-      // person has looked; the index notes where the other version is.
-      index.set(id, { ...had, conflicts: [...new Set([...(had.conflicts ?? []), where])].sort() });
+      conflict(id, served, conflicts, had);
       continue;
     }
 
-    // Write: files first, batch.json last, index at the very end.
+    // Files first, batch.json last; the whole folder is swapped in at the end of the run.
     for (const [f, b] of Object.entries(next)) {
       if (!oldFiles[f] || !oldFiles[f].equals(b)) writeAtomic(join(dir, f), b);
     }
     const recBytes = Buffer.from(stableJson(rec));
-    if (!old || stableJson(old) !== recBytes.toString()) writeAtomic(join(dir, 'batch.json'), recBytes);
+    writeIfChanged(join(dir, 'batch.json'), recBytes);
     index.set(id, {
       batchId: id,
       root: rec.root,
       sealedAt: rec.sealedAt,
-      anchor: rec.anchor ? { network: rec.anchor.network ?? null, txHash: rec.anchor.txHash ?? null, blockHeight: rec.anchor.blockHeight ?? null } : null,
+      anchor: rec.anchor ? { network: rec.anchor.network, txHash: rec.anchor.txHash, blockHeight: rec.anchor.blockHeight ?? null } : null,
       files: Object.fromEntries([['batch.json', sha256(recBytes)], ...Object.entries(next).map(([f, b]) => [f, sha256(b)])].sort()),
       ...(had?.conflicts ? { conflicts: had.conflicts } : {}),
     });
@@ -201,14 +279,11 @@ export const mirror = async ({ api, out, fetchImpl = fetch, full = false, now = 
   }
 
   // A batch the mirror has and the registry no longer lists: history shrank.
-  const listedIds = new Set(listed.map((b) => b.batchId));
-  for (const id of known.keys()) {
+  const listedIds = new Set(listed.map((e) => (e.rec ?? e.bad).batchId));
+  for (const [id, had] of known) {
     if (listedIds.has(id)) continue;
     summary.missingFromRegistry.push(id);
-    const where = keepConflict(out, id, {}, ['the registry no longer lists this batch'], now);
-    index.set(id, { ...index.get(id), conflicts: [...new Set([...(index.get(id).conflicts ?? []), where])].sort() });
-    summary.conflicts.push({ batchId: id, reasons: ['the registry no longer lists this batch'], keptIn: where });
-    log(`CONFLICT ${id}: the registry no longer lists this batch (the mirror keeps its copy)`);
+    conflict(id, {}, ['the registry no longer lists this batch'], had);
   }
 
   const batches = [...index.values()].sort(order);

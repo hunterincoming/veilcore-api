@@ -10,9 +10,11 @@ bytes). The root is dated three ways: a transaction on Midnight mainnet, an Open
 proof on Bitcoin, and an RFC 3161 timestamp token. A record shows **prior possession** by a
 date when its fingerprint is in a batch whose root was dated.
 
-A witness keeps a copy of every batch root and its proofs, and keeps checking that VeilCore's
-registry never changes them. If the registry is ever gone, or quietly changes a root or a date,
-your copy is the evidence of what it said before.
+A witness keeps a copy of every batch root and its proofs. Each run fetches them again and
+compares: every file of every batch while there are up to 200 batches, and past that a quarter
+of the finished ones per run, in turn (`--full` fetches everything). If the registry is ever
+gone, or quietly changes a root, a date, a token or a proof, your copy is the evidence of what
+it said before.
 
 ## What you need
 
@@ -65,12 +67,17 @@ is a second record:
 ```
 cd ~/veilcore-witness && git init      # once
 # then each day:
-node ~/veilcore-api/scripts/mirror/witness.mjs mirror ~/veilcore-witness \
-  && cd ~/veilcore-witness && git add -A && git commit -qm "mirror $(date -u +%F)"
+node ~/veilcore-api/scripts/mirror/witness.mjs mirror ~/veilcore-witness ; \
+  cd ~/veilcore-witness && git add -A && git commit -qm "mirror $(date -u +%F)"
 ```
 
-Add `--full` once a week: it fetches every file again rather than only those that can still
-change.
+`;`, not `&&`: a run that found a conflict (exit 2) has the other version to commit. Add
+`--full` once a week once there are more than 200 batches.
+
+**Exit codes of `mirror`:** 0, done; 2, the registry changed history (below); 1, the run
+could not finish: the registry did not answer, or its answer could not be used (not JSON, a
+batch with no usable id, the same batch listed twice differently, a page cursor that goes
+nowhere). After exit 1 the folder is exactly as it was before the run; try again later.
 
 ## Reading the results
 
@@ -93,6 +100,12 @@ serves a different history from the one you copied. In either case:
    instead is in `conflicts/`.
 2. Tell the registry operator (the security contact in `SECURITY.md` of this repository),
    and anyone relying on those dates.
+
+**After you have looked at a conflict.** Leave `conflicts/` and the `conflicts` note in
+`index.json` in place, even once it is explained: they are the record that it happened, and
+`check` keeps reporting the batch as a mismatch on purpose. If the operator explains it, write
+the explanation down beside it (a `NOTE.md` in that `conflicts/<batchId>/` folder, committed).
+Never edit the batch's own files to match the registry.
 
 ## What this does not check
 
