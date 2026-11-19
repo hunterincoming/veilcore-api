@@ -3548,7 +3548,10 @@ app.post('/attesters/:publicKey/domain', async (req, res) => {
   while (lastDomainLook.size > 10_000) lastDomainLook.delete(lastDomainLook.keys().next().value);
   const out = await checkLabDomain(domain, key, labDomainOptions);
   if (out.error) return res.status(400).json(out);
-  attesters.setDomainCheck(key, out, { claimIssuedAt: issuedAt, claimSignature: String(req.body.signature).toLowerCase() });
+  // The claim is checked again right before the write: the look took time, and a withdrawal
+  // or a newer claim recorded meanwhile wins (review, 18 Nov 2026).
+  const wrote = attesters.setDomainCheck(key, out, { claimIssuedAt: issuedAt, claimSignature: String(req.body.signature).toLowerCase() });
+  if (wrote.error) return res.status(wrote.code === 'withdrawn' ? 409 : 400).json({ error: wrote.error, ...(wrote.code ? { code: wrote.code, domain: wrote.domain } : {}) });
   res.json(out);
 });
 /** Tests replace the network parts (fetchFile, resolveTxt). */
@@ -3567,9 +3570,13 @@ const relookLabDomains = async (olderThanMs) => {
   const { checkLabDomain } = await import('./lineage/lab-domain.mjs');
   const due = attesters.domainChecksDue(olderThanMs);
   const work = async () => {
+    // Every website the key is watched on: the current one, ones it moved from, a withdrawn one
+    // (lab-domain.mjs domainsToLook). A look at one the record no longer watches is skipped.
     for (let d = due.shift(); d; d = due.shift()) {
-      const out = await checkLabDomain(d.domain, d.publicKey, labDomainOptions);
-      if (!out.error) attesters.setDomainCheck(d.publicKey, out, { expectDomain: d.domain });
+      for (const domain of d.domains) {
+        const out = await checkLabDomain(domain, d.publicKey, labDomainOptions);
+        if (!out.error) attesters.setDomainCheck(d.publicKey, out);
+      }
     }
   };
   await Promise.all(Array.from({ length: 8 }, work));

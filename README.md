@@ -1209,13 +1209,16 @@ record, and 16 KiB at most (`lineage/lab-domain.mjs`). `domainCheck.claim` carri
 own signature naming the domain, so anyone can check both directions; for did:web it also
 carries `did` and `didKeyId`.
 
-A key the website stopped listing is served as `domainWithdrawn` (`{domain, method, withdrawnAt,
-checkedAt, claim}`): only when it was listed there before and a look then got a real "not
-here" from the website and DNS (a file without it or a 404, and a DNS answer), never on a
-timeout, an error page or a broken file. It is kept, not forgotten after 30 days, until the
-website lists the key again, and until then the key can't name another website (409, code
-`withdrawn`), so whoever took a lab's key can't point it at a lookalike to wipe the
-withdrawal. `/health` lists `lab-domain-withdrawn-v1`. Why
+A key a website had listed (seen by this version) and then answered without twice, at least
+20 hours apart, is served as `domainWithdrawn` (`{domain, method, withdrawnAt, claim}`). A real
+answer is a lab file without the key or a 404/410, a did.json without it, a 404/410 or a 200
+that isn't a DID document, and a DNS answer; a timeout, 5xx, 403 or broken lab file is not, and
+such a look changes nothing but `lastTriedAt` (so one timeout never hides a listing). The
+registry keeps watching up to four websites a key moved away from, so a key moved to a
+lookalike first can still be withdrawn by the lab's real website. A withdrawal is kept until
+that website lists the key again; until then the key can't name another website (409, code
+`withdrawn`), checked again right before each write. A record written before this version is
+never turned "withdrawn" until this version has seen its website list the key. `/health` lists `lab-domain-withdrawn-v1`. Why
 and what pages say: the site repo's `docs/lab-domain-keys.md`.
 
 ## Lab results
