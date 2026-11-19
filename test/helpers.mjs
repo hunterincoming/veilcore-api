@@ -116,9 +116,10 @@ const open = (box, key, aad) => {
  * A record (or, with table "licenses", a licence) as the browser sends it. A record keeps
  * its public fields in the clear (since round 5 not its name: that is sealed too) (`supersedes` only as recordId, changedFields,
  * effectiveAt) and seals everything else, the full `supersedes` included. A licence is
- * { id, sealed } with everything but its id inside.
+ * { id, sealed } with everything but its id inside. `inside` names public fields sealed instead
+ * (a copy of a record another holder dated keeps its proof code inside: lab-result-copy.test.mjs).
  */
-export const sealForTest = (record, key, table = 'records', { pad = false } = {}) => {
+export const sealForTest = (record, key, table = 'records', { pad = false, inside: sealedToo = [] } = {}) => {
   const kid = kidOf(key);
   if (table === 'licenses') {
     const { id, ...inside } = record;
@@ -128,7 +129,7 @@ export const sealForTest = (record, key, table = 'records', { pad = false } = {}
   const inside = {};
   for (const [k, v] of Object.entries(record)) {
     if (k === 'sealed') continue;
-    if (PUBLIC_FIELDS.includes(k) && k !== 'supersedes') out[k] = v;
+    if (PUBLIC_FIELDS.includes(k) && k !== 'supersedes' && !sealedToo.includes(k)) out[k] = v;
     else inside[k] = v;
   }
   if (record.supersedes && typeof record.supersedes === 'object') {
