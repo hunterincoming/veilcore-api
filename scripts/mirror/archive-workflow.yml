@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  #v6.0.3
         with:
           repository: hunterincoming/veilcore-api
-          ref: TOOL_COMMIT
+          ref: b7edc2259b1cb01262a59bccec9ad36b621520fa  # update on purpose; if the PR is squash-merged, use the merge commit on main
           path: tool
           persist-credentials: false
 
