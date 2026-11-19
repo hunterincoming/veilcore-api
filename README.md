@@ -1318,6 +1318,16 @@ sent from it (`transfers.created_at`). So a fingerprint already taken over keeps
 held it first. The "before the signature" rule above is the second guard: a takeover, or a
 delivery offered to read what was already signed, always comes after.
 
+**A copy of a record another holder dated** (18 Nov 2026). A lab keeps every result it signs as
+a record it holds, so the result's proof code is the lab's here, and the breeder it was signed
+for adds the same record from the lab's file. The site sends that copy with the proof code and a
+`copy` mark inside `sealed` only, and never sends the proof code to `PUT /api/records/dating`.
+To this registry it is a sealed row with no proof code: the rule above never sees it, and
+nothing that reads a proof code (dating, deliveries, private lab signatures, `/verify`, deletion)
+ties the lab's proof code to the breeder. Nothing here changed for it;
+`test/lab-result-copy.test.mjs` holds the registry to that. Sent with the proof code in the clear,
+the copy is refused as before.
+
 **What a lab's result may name** (`POST /transfers/:id/results?attestationId=`, see Lab
 results): a lab report signature about the plant the delivery sent, by this delivery's lab
 key. That key is the key of its receipt, or else of its earlier reports on the delivery. A
