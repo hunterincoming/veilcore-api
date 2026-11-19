@@ -16,6 +16,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { verifyAttestation, verifyRetraction, attesterId, canonicalise } from 'veilcore-records';
+import { applyLook, claimAllowed, domainsToLook } from './lab-domain.mjs';
 
 /**
  * How much an attestation is worth, decided by the registry rather than by the signer.
@@ -460,28 +461,51 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
   };
   const isVetted = (publicKey) =>
     nameCheckStatus(db.prepare('SELECT * FROM attesters WHERE public_key = ?').get(publicKey), now()).status === 'checked';
-  /**
-   * The last look at the lab's own domain, while it is recent and found the key listed.
-   * Older than DOMAIN_CHECK_FRESH_DAYS (the daily look stopped, or the domain stopped
-   * answering), or not listed: nothing is shown.
-   */
-  const publicDomainCheck = (json) => {
+  const parseDomainRecord = (json) => {
     if (!json) return null;
-    let c;
     try {
-      c = JSON.parse(json);
+      return JSON.parse(json);
     } catch {
       return null;
     }
-    const age = now() - Date.parse(c.checkedAt);
-    if (!c.listed || !(age >= -60_000 && age <= DOMAIN_CHECK_FRESH_DAYS * 86_400_000)) return null;
+  };
+  /**
+   * The lab's own domain listing this key: while the last look that found it is under
+   * DOMAIN_CHECK_FRESH_DAYS old, and no website the key named has withdrawn it. A look that got
+   * no answer doesn't hide it (lab-domain.mjs applyLook); 7 days without a finding does.
+   */
+  const publicDomainCheck = (json) => {
+    const c = parseDomainRecord(json);
+    if (!c || c.forgotten || c.withdrawn || !c.listed || !c.domain) return null;
+    const seen = c.listedAt ?? c.checkedAt;
+    const age = now() - Date.parse(seen);
+    if (!(age >= -60_000 && age <= DOMAIN_CHECK_FRESH_DAYS * 86_400_000)) return null;
     return {
-      domain: c.domain, method: c.method, checkedAt: c.checkedAt,
+      domain: c.domain, method: c.method, checkedAt: seen,
       ...(c.fileSha256 ? { fileSha256: c.fileSha256 } : {}),
       ...(c.listedName ? { listedName: c.listedName } : {}),
+      // did:web (method 'did'): the DID and the verification method that holds the key.
+      ...(c.did ? { did: c.did } : {}),
+      ...(c.didKeyId ? { didKeyId: c.didKeyId } : {}),
       // The key's own signature naming this domain (lab-domain.mjs domainClaimPayload), so
       // anyone can check that direction too, not only the registry.
       ...(c.claimSignature && Number.isSafeInteger(c.claimIssuedAt) ? { claim: { issuedAt: c.claimIssuedAt, signature: c.claimSignature } } : {}),
+    };
+  };
+  /**
+   * A website the key named stopped listing it: two real "not here" answers at least 20 hours
+   * apart, after this version saw it listed there (lab-domain.mjs applyLook). With the key's
+   * signed claim naming that website, so a page can check the key really named it. Kept until
+   * that website lists the key again.
+   */
+  const publicDomainWithdrawn = (json) => {
+    const w = parseDomainRecord(json)?.withdrawn;
+    if (!w?.domain || !w.claimSignature || !Number.isSafeInteger(w.claimIssuedAt)) return null;
+    return {
+      domain: w.domain,
+      ...(w.method ? { method: w.method } : {}),
+      withdrawnAt: w.at,
+      claim: { issuedAt: w.claimIssuedAt, signature: w.claimSignature },
     };
   };
   /** What the public may read about a key's name check: the record, never a note. */
@@ -530,6 +554,7 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
             nameCheck: pub.nameCheck,
             nameCheckStatus: pub.nameCheckStatus,
             domainCheck: publicDomainCheck(row.domain_check),
+            domainWithdrawn: publicDomainWithdrawn(row.domain_check),
           }
         : null,
       retraction: row.retraction ? signedRetraction(JSON.parse(row.retraction)) : null,
@@ -685,71 +710,54 @@ export const createAttesters = (db, { now = () => Date.now() } = {}) => {
         ...publicNameCheck(r),
         // The lab's own domain lists this key (lab-domain.mjs), as last seen; null otherwise.
         domainCheck: publicDomainCheck(r.domain_check),
+        domainWithdrawn: publicDomainWithdrawn(r.domain_check),
       };
     },
 
     /**
      * The domain the key itself named (a signed claim, lab-domain.mjs verifyDomainClaim), or
-     * an error. A claim older than the one on record is refused, so an old signature can't
-     * point a lab back at a domain it has left.
+     * an error: an older claim than the one on record (an old signature can't point a lab back
+     * at a domain it has left), or any other website while one has withdrawn the key. Checked
+     * again in setDomainCheck right before the write, after the look.
      */
     claimDomain(publicKey, domain, issuedAt) {
       const row = db.prepare('SELECT domain_check FROM attesters WHERE public_key = ?').get(publicKey);
       if (!row) return { error: 'not registered' };
       if (issuedAt > now() + 5 * 60_000) return { error: 'issuedAt is in the future' };
-      let prev = null;
-      try { prev = row.domain_check ? JSON.parse(row.domain_check) : null; } catch { /* unreadable: replaced */ }
-      if (prev?.claimIssuedAt && issuedAt <= prev.claimIssuedAt) return { error: 'an older claim than the one on record' };
-      return { ok: true, prev };
+      const prev = parseDomainRecord(row.domain_check);
+      const ok = claimAllowed(prev, domain, issuedAt);
+      return ok.error ? ok : { ok: true, prev };
     },
 
     /**
-     * Record a look at the lab's domain (lab-domain.mjs checkLabDomain's result). `claimIssuedAt`
-     * comes from the key's signed claim when the lab asked; a daily look keeps the one on record.
-     * A domain not found for 30 days is forgotten.
+     * Record a look at one of the key's websites (lab-domain.mjs checkLabDomain's result) by
+     * the rules in lab-domain.mjs applyLook. With `claimIssuedAt` (the lab asked), the claim is
+     * checked again here: better-sqlite3 is synchronous, so read, check and write are one step
+     * and a look that took 15 seconds can't overwrite what happened meanwhile.
      */
-    setDomainCheck(publicKey, result, { claimIssuedAt, claimSignature, expectDomain } = {}) {
+    setDomainCheck(publicKey, result, { claimIssuedAt, claimSignature } = {}) {
       const row = db.prepare('SELECT domain_check FROM attesters WHERE public_key = ?').get(publicKey);
       if (!row) return { error: 'not registered' };
-      let prev = null;
-      try { prev = row.domain_check ? JSON.parse(row.domain_check) : null; } catch { /* replaced */ }
-      const { domain, listed, method, checkedAt, fileSha256, listedName } = result;
-      // A daily look writes only if the lab hasn't named another domain while it looked
-      // (second check, 5 Nov 2026: it could put the old domain back).
-      if (expectDomain !== undefined && prev?.domain !== expectDomain) return { ok: true, skipped: true };
-      const sameDomain = prev?.domain === domain;
-      const listedAt = listed ? checkedAt : sameDomain ? prev?.listedAt : undefined;
-      const since = sameDomain ? (prev?.since ?? checkedAt) : checkedAt;
-      if (!listed && Date.parse(checkedAt) - Date.parse(listedAt ?? since) > 30 * 86_400_000) {
-        // Forget the domain but keep the newest claim's time, so an old signed claim can't
-        // be replayed afterwards.
-        db.prepare('UPDATE attesters SET domain_check = ? WHERE public_key = ?').run(
-          JSON.stringify({ forgotten: true, listed: false, claimIssuedAt: claimIssuedAt ?? prev?.claimIssuedAt }),
-          publicKey,
-        );
-        return { ok: true, forgotten: true };
-      }
-      db.prepare('UPDATE attesters SET domain_check = ? WHERE public_key = ?').run(
-        JSON.stringify({
-          domain, listed: !!listed, method, checkedAt, fileSha256, listedName, listedAt, since,
-          claimIssuedAt: claimIssuedAt ?? (sameDomain ? prev?.claimIssuedAt : undefined),
-          claimSignature: claimSignature ?? (sameDomain ? prev?.claimSignature : undefined),
-        }),
-        publicKey,
-      );
-      return { ok: true };
+      const out = applyLook(parseDomainRecord(row.domain_check), result, { claimIssuedAt, claimSignature });
+      if (out.error || out.skipped) return out;
+      db.prepare('UPDATE attesters SET domain_check = ? WHERE public_key = ?').run(JSON.stringify(out.record), publicKey);
+      return { ok: true, ...(out.forgotten ? { forgotten: true } : {}) };
     },
 
-    /** Keys with a domain on record whose last look is older than `olderThanMs`, oldest first. */
+    /** Keys whose websites were last looked at more than `olderThanMs` ago, oldest first, with every website to look at. */
     domainChecksDue(olderThanMs = 23 * 3_600_000, limit = 500) {
       const before = new Date(now() - olderThanMs).toISOString();
       return db
-        .prepare(`SELECT public_key, json_extract(domain_check, '$.domain') AS domain FROM attesters
-          WHERE domain_check IS NOT NULL AND json_extract(domain_check, '$.domain') IS NOT NULL
-            AND json_extract(domain_check, '$.checkedAt') < ?
-          ORDER BY json_extract(domain_check, '$.checkedAt') LIMIT ?`)
+        .prepare(`SELECT public_key, domain_check FROM attesters
+          WHERE domain_check IS NOT NULL
+            AND (json_extract(domain_check, '$.domain') IS NOT NULL
+                 OR json_array_length(json_extract(domain_check, '$.history')) > 0
+                 OR json_extract(domain_check, '$.withdrawn') IS NOT NULL)
+            AND coalesce(json_extract(domain_check, '$.lookedAt'), json_extract(domain_check, '$.checkedAt')) < ?
+          ORDER BY coalesce(json_extract(domain_check, '$.lookedAt'), json_extract(domain_check, '$.checkedAt')) LIMIT ?`)
         .all(before, limit)
-        .map((r) => ({ publicKey: r.public_key, domain: r.domain }));
+        .map((r) => ({ publicKey: r.public_key, domains: domainsToLook(parseDomainRecord(r.domain_check)) }))
+        .filter((r) => r.domains.length > 0);
     },
 
     /**

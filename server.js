@@ -779,6 +779,9 @@ const featuresServed = () => [
   ...(deals ? ['deals-v1'] : []),
   ...(paymentReceipts ? ['payment-receipts-v1'] : []),
   ...(passkeyVault ? ['passkey-vault-v1'] : []),
+  // A lab's key on its own website (lineage/lab-domain.mjs): did:web documents read too, and a
+  // key the website stopped listing served as `domainWithdrawn`. A site reads both if present.
+  'lab-domain-withdrawn-v1',
 ];
 app.get('/health', (_req, res) => {
   // licenseChecks: what checking a signed license notice or answer needs (license notices, below).
@@ -3537,7 +3540,7 @@ app.post('/attesters/:publicKey/domain', async (req, res) => {
     return res.status(400).json({ error: 'the key\'s signature over this domain does not verify' });
   }
   const claim = attesters.claimDomain(key, domain, issuedAt);
-  if (claim.error) return res.status(claim.error === 'not registered' ? 404 : 400).json({ error: claim.error });
+  if (claim.error) return res.status(claim.error === 'not registered' ? 404 : claim.code === 'withdrawn' ? 409 : 400).json({ error: claim.error, ...(claim.code ? { code: claim.code, domain: claim.domain } : {}) });
   const last = lastDomainLook.get(key) ?? 0;
   if (Date.now() - last < 10 * 60_000) return res.status(429).json({ error: 'looked less than ten minutes ago; try again later' });
   lastDomainLook.delete(key);
@@ -3545,12 +3548,17 @@ app.post('/attesters/:publicKey/domain', async (req, res) => {
   while (lastDomainLook.size > 10_000) lastDomainLook.delete(lastDomainLook.keys().next().value);
   const out = await checkLabDomain(domain, key, labDomainOptions);
   if (out.error) return res.status(400).json(out);
-  attesters.setDomainCheck(key, out, { claimIssuedAt: issuedAt, claimSignature: String(req.body.signature).toLowerCase() });
+  // The claim is checked again right before the write: the look took time, and a withdrawal
+  // or a newer claim recorded meanwhile wins (review, 18 Nov 2026).
+  const wrote = attesters.setDomainCheck(key, out, { claimIssuedAt: issuedAt, claimSignature: String(req.body.signature).toLowerCase() });
+  if (wrote.error) return res.status(wrote.code === 'withdrawn' ? 409 : 400).json({ error: wrote.error, ...(wrote.code ? { code: wrote.code, domain: wrote.domain } : {}) });
   res.json(out);
 });
 /** Tests replace the network parts (fetchFile, resolveTxt). */
 let labDomainOptions = {};
 const setLabDomainOptions = (o) => { labDomainOptions = o; };
+/** Tests only: forget the ten-minute limit between looks. */
+const lastDomainLookReset = () => lastDomainLook.clear();
 
 /**
  * Look again at every lab domain whose last look is a day old, eight at a time, each look
@@ -3562,9 +3570,13 @@ const relookLabDomains = async (olderThanMs) => {
   const { checkLabDomain } = await import('./lineage/lab-domain.mjs');
   const due = attesters.domainChecksDue(olderThanMs);
   const work = async () => {
+    // Every website the key is watched on: the current one, ones it moved from, a withdrawn one
+    // (lab-domain.mjs domainsToLook). A look at one the record no longer watches is skipped.
     for (let d = due.shift(); d; d = due.shift()) {
-      const out = await checkLabDomain(d.domain, d.publicKey, labDomainOptions);
-      if (!out.error) attesters.setDomainCheck(d.publicKey, out, { expectDomain: d.domain });
+      for (const domain of d.domains) {
+        const out = await checkLabDomain(domain, d.publicKey, labDomainOptions);
+        if (!out.error) attesters.setDomainCheck(d.publicKey, out);
+      }
     }
   };
   await Promise.all(Array.from({ length: 8 }, work));
@@ -4071,7 +4083,7 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: status === 500 ? 'internal error' : String(err?.message ?? 'bad request') });
 });
 
-module.exports = { app, db, convertPlaintextNow, setLabDomainOptions, relookLabDomains };
+module.exports = { app, db, convertPlaintextNow, setLabDomainOptions, relookLabDomains, lastDomainLookReset };
 
 if (require.main === module) {
   const port = process.env.PORT || 8787;

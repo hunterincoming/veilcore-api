@@ -1192,19 +1192,33 @@ this version on. That is intended: re-check the lab by the procedure and mark it
 
 A lab can list its key where only it can write: a file at
 `https://<domain>/.well-known/veilcore-lab.json` (`{"format":"veilcore-lab/v1","name":…,
-"keys":[{"publicKey":…}]}`) or a TXT record `veilcore-lab=v1 key=<hex>` at
-`_veilcore-lab.<domain>`. `POST /attesters/:publicKey/domain` with `{domain, issuedAt,
+"keys":[{"publicKey":…}]}`), a W3C did:web document at `https://<domain>/.well-known/did.json`
+(id `did:web:<domain>`, the key as a `Multikey`, `Ed25519VerificationKey2020` or
+`JsonWebKey2020` verification method listed under `assertionMethod`), or a TXT record
+`veilcore-lab=v1 key=<hex>` at `_veilcore-lab.<domain>`. `POST /attesters/:publicKey/domain` with `{domain, issuedAt,
 signature}`, the key's Ed25519 signature over `veilcore:lab-domain:v1\n<key>\n<domain>\n<issuedAt>`
 (only the key names its domain; never a claim older than the one on record; one look per key
 per ten minutes). The registry looks again hourly at any domain last looked at a day ago,
-eight at a time, so a key the lab removes stops showing; a domain not found for 30 days is
-forgotten. It records only what it saw (domain, file
+eight at a time, so a key the lab removes stops showing; a domain that never listed the key,
+or stopped answering, is forgotten after 30 days. It records only what it saw (domain, file
 or DNS, time, the file's SHA-256), and `GET /attesters/:publicKey` and every attestation
 carry it as `domainCheck` while the last look found the key and is under 7 days old. It is
 not a name check and never sets `vetted`. The fetch goes only to public addresses, checked at
 connect time, with no redirects, 5 s for the file (body included) and 5 s for the DNS
 record, and 16 KiB at most (`lineage/lab-domain.mjs`). `domainCheck.claim` carries the key's
-own signature naming the domain, so anyone can check both directions. Why
+own signature naming the domain, so anyone can check both directions; for did:web it also
+carries `did` and `didKeyId`.
+
+A key a website had listed (seen by this version) and then answered without twice, at least
+20 hours apart, is served as `domainWithdrawn` (`{domain, method, withdrawnAt, claim}`). A real
+answer is a lab file without the key or a 404/410, a did.json without it, a 404/410 or a 200
+that isn't a DID document, and a DNS answer; a timeout, 5xx, 403 or broken lab file is not, and
+such a look changes nothing but `lastTriedAt` (so one timeout never hides a listing). The
+registry keeps watching up to four websites a key moved away from, so a key moved to a
+lookalike first can still be withdrawn by the lab's real website. A withdrawal is kept until
+that website lists the key again; until then the key can't name another website (409, code
+`withdrawn`), checked again right before each write. A record written before this version is
+never turned "withdrawn" until this version has seen its website list the key. `/health` lists `lab-domain-withdrawn-v1`. Why
 and what pages say: the site repo's `docs/lab-domain-keys.md`.
 
 ## Lab results
