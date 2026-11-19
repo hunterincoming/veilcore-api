@@ -3471,10 +3471,24 @@ app.get('/batches/:id/root.tst', (req, res) => {
   res.type('application/octet-stream').set('Content-Disposition', 'attachment; filename="root.tst"').send(b.token);
 });
 
-/** Every batch, anchored or pending, with its OpenTimestamps status. */
-app.get('/batches', (_req, res) => {
+/**
+ * Every batch, anchored or pending, with its OpenTimestamps status. With `?limit=` (1-500),
+ * one page, newest first, and `next`: pass it as `?before=` for the page after, null on the
+ * last (scripts/mirror). Without `limit`, every batch in one answer, as the site reads it.
+ */
+const BATCH_PAGE_MAX = 500;
+app.get('/batches', (req, res) => {
   if (!requireBatches(res)) return;
-  res.json({ batches: batches.list() });
+  const { limit, before } = req.query;
+  if (limit === undefined && before === undefined) return res.json({ batches: batches.list() });
+  const n = typeof limit === 'string' && /^[1-9][0-9]{0,3}$/.test(limit) ? Number(limit) : NaN;
+  if (!(n <= BATCH_PAGE_MAX)) return res.status(400).json({ error: `limit must be a whole number from 1 to ${BATCH_PAGE_MAX}` });
+  if (before !== undefined && (typeof before !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(before))) {
+    return res.status(400).json({ error: 'before must be a batchId' });
+  }
+  const out = batches.list({ limit: n, ...(before !== undefined ? { before } : {}) });
+  if (out.error) return res.status(400).json({ error: out.error });
+  res.json(out);
 });
 
 // ---- attester registry ----

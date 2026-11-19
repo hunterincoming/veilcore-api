@@ -1851,3 +1851,45 @@ Operator routes (`x-operator-token`):
 
 Batches sealed before stamping existed are not stamped automatically. Stamp them with
 the first route if wanted (the Bitcoin date is then the date of that stamp).
+
+## Public mirror and witnesses (`scripts/mirror`, 18 Nov 2026)
+
+Every batch root, its Bitcoin proof and its RFC 3161 token used to live only on this
+registry. Midnight and Bitcoin hold the dates, but nobody kept the files needed to check
+them. `scripts/mirror/witness.mjs` keeps a copy anyone can check, with Node alone (no
+`npm install`):
+
+```
+node scripts/mirror/witness.mjs mirror <folder>   # copy every batch (append-only)
+node scripts/mirror/witness.mjs check  <folder>   # check every batch, no VeilCore server
+```
+
+**mirror** writes one folder per batch (`batches/<batchId>/`: `batch.json`, `root.bin`,
+`root.bin.ots`, `root.tst`), `registry.json` (the `/.well-known` answer) and `index.json`
+(every batch with each file's SHA-256). A run works on a copy and swaps it in only when it
+finishes, so a run that dies half way (exit 1) leaves the folder as it was. Each run fetches
+the files again and compares them, all of them up to 200 batches and a quarter per run past
+that (`--full` for all). It never overwrites what it has. Normal changes are
+taken: a first anchor; a test-network anchor followed by a mainnet one the registry keeps in
+`earlierAnchors`; a token where there was none; a `.ots` that keeps every operation and
+Bitcoin attestation of the old one and adds to it (pending → Bitcoin). Anything else (a root,
+sealing time, record count, mainnet anchor or token changed; a file or batch gone; a proof
+that loses a Bitcoin attestation) is a conflict: the copy stays, what the registry served is
+kept in `conflicts/<batchId>/`, and the command exits 2 with a loud message. A batch once in
+conflict stays marked in `index.json`. Every field the registry sends is checked before it is kept or
+printed (hashes as 64 hex, names as short plain names, dates as dates); a batch that fails is
+filed as a conflict and never added, and `check` reports it as a mismatch.
+
+**check** reports each batch's files, RFC 3161 token, Bitcoin proof and Midnight anchor as
+OK, MISMATCH or COULDN'T CHECK, with the reason, and exits 2 on any mismatch.
+[docs/run-a-witness.md](docs/run-a-witness.md) says what each check shows, what it needs,
+and what it does not cover.
+
+`GET /batches` takes `?limit=` (1-500) and `?before=<batchId>` for pages, newest first, and
+answers `next` (null on the last page). Without them it answers every batch, as before.
+
+What it is not: it is only as independent as whoever runs it. Our own copy (a public
+repository updated by a scheduled GitHub workflow, `scripts/mirror/archive-workflow.yml`)
+keeps a dated history of what the registry served, but it is run by us. The step up is a
+party outside VeilCore, such as a university or a lab, running the same two commands. The
+mirror holds batches, not records: each holder's proofs are in their own backup file.
