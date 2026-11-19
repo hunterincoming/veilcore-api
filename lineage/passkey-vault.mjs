@@ -9,9 +9,13 @@
 // What the registry holds and learns:
 //   - a vault id, a write token's SHA-256, and one AES-GCM ciphertext per id. The id, the
 //     token and the encryption key all come from the passkey's PRF output in the browser
-//     (site veilcore/passkey-backup.ts). The registry can't open the copy, can't tie it to a
-//     holder, and can't change it without the browser noticing;
+//     (site veilcore/passkey-backup.ts). The registry can't open the copy or change it without
+//     the browser noticing. It can guess which holder a copy belongs to from when and from
+//     where it is saved (a save right after a record write, from the same address);
 //   - nothing else: no account, no email, no passkey public key.
+//
+// Since the account copy (account-copy.mjs, November 2026) the site makes no new copies here: it
+// reads an existing one once, moves it into an account copy, and deletes it here.
 //
 // What it can still do is withhold the copy or serve an older one. The copy carries its own
 // date inside the ciphertext, and the page shows it before restoring.

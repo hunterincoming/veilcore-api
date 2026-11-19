@@ -191,6 +191,7 @@ let licenseInvites = null; // lineage/license-invites.mjs, set once loaded
 let deals = null; // lineage/deals.mjs, set once loaded
 let paymentReceipts = null; // lineage/payment-receipts.mjs, set once loaded
 let passkeyVault = null; // lineage/passkey-vault.mjs, set once loaded
+let accountCopies = null; // lineage/account-copy.mjs, set once loaded
 let labResults = null; // lineage/lab-results.mjs, set once loaded
 let embed = null;
 // The commitment checker (lineage/conformance.mjs). Until sealed records (16 Oct 2026) it
@@ -244,6 +245,8 @@ import('./lineage/routes.mjs')
     paymentReceipts = createPaymentReceipts(db, attesters);
     const { createPasskeyVault } = await import('./lineage/passkey-vault.mjs');
     passkeyVault = createPasskeyVault(db);
+    const { createAccountCopies } = await import('./lineage/account-copy.mjs');
+    accountCopies = createAccountCopies(db);
     const { createProveRequests } = await import('./lineage/prove-requests.mjs');
     proveRequests = createProveRequests(db);
     const { createLabResults, folderFiles, memoryFiles } = await import('./lineage/lab-results.mjs');
@@ -504,6 +507,8 @@ const LICENCE_BODY_LIMIT = 4 * 1024 * 1024;
 app.put('/api/licenses', express.json({ limit: LICENCE_BODY_LIMIT, verify: countWriteBytes }));
 // A passkey copy of a backup can be larger than other bodies (lineage/passkey-vault.mjs).
 app.put('/vault/:id', express.json({ limit: '3mb', verify: countWriteBytes }));
+// So can the account copy (lineage/account-copy.mjs): padded to a power of two, up to 2 MiB.
+app.put('/account-copy/:id', express.json({ limit: '3mb', verify: countWriteBytes }));
 // Paddle's webhook for paid plans (billing.js): its signature is over the body's exact bytes,
 // so it gets them raw, before the JSON parser below. Off unless BILLING=on.
 app.post('/api/billing/paddle', express.raw({ type: '*/*', limit: '256kb' }), (req, res) => billing.webhook(req, res));
@@ -779,13 +784,16 @@ const featuresServed = () => [
   ...(deals ? ['deals-v1'] : []),
   ...(paymentReceipts ? ['payment-receipts-v1'] : []),
   ...(passkeyVault ? ['passkey-vault-v1'] : []),
+  // The account copy (lineage/account-copy.mjs): one locked copy of a person's keys, opened by
+  // several ways in, saved by itself. A site that saves it needs a registry with these routes.
+  ...(accountCopies ? ['account-copy-v1'] : []),
   // A lab's key on its own website (lineage/lab-domain.mjs): did:web documents read too, and a
   // key the website stopped listing served as `domainWithdrawn`. A site reads both if present.
   'lab-domain-withdrawn-v1',
 ];
 app.get('/health', (_req, res) => {
   // licenseChecks: what checking a signed license notice or answer needs (license notices, below).
-  const parts = { conformance, embed, lineage, transfers, batches, attesters, licenseInvites, deals, paymentReceipts, passkeyVault, licenseChecks: licenseChecksReady() };
+  const parts = { conformance, embed, lineage, transfers, batches, attesters, licenseInvites, deals, paymentReceipts, passkeyVault, accountCopies, licenseChecks: licenseChecksReady() };
   const notReady = Object.keys(parts).filter((k) => !parts[k]);
   if (notReady.length === 0 && loadsRunning === 0) return res.json({ ok: true, features: featuresServed() });
   res.status(503).json({ ok: false, status: loadsRunning > 0 ? 'starting' : 'failed', notReady, features: featuresServed() });
@@ -3945,6 +3953,60 @@ app.post('/vault/:id/read', (req, res) => {
 app.post('/vault/:id/delete', (req, res) => {
   if (!requireVault(res)) return;
   inviteReply(res, passkeyVault.remove(req.params.id, (req.body || {}).token));
+});
+
+// --- the account copy (lineage/account-copy.mjs) ---
+//
+// Every route but /account-slot/:slotId/read needs the copy's write token, which only the account
+// key makes; a way in's own token only reads that way in (security review S3). Tokens travel in
+// POST and PUT bodies, never in a URL.
+
+const requireAccount = (res) => {
+  if (!accountCopies) { res.status(503).json({ error: 'account copies not ready' }); return false; }
+  res.set('Cache-Control', 'no-store');
+  return true;
+};
+
+/** Save the copy over the one this device last saw; the first save brings its first way in. */
+app.put('/account-copy/:id', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.put(req.params.id, req.body || {}, clientBucket(req.ip)));
+});
+
+/** The copy and its ways in. */
+app.post('/account-copy/:id/read', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.read(req.params.id, (req.body || {}).token));
+});
+
+/** Whether there is a newer copy: its fingerprint, date and ways in, without the copy. */
+app.post('/account-copy/:id/head', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.head(req.params.id, (req.body || {}).token));
+});
+
+/** Delete the copy and every way in to it. */
+app.post('/account-copy/:id/delete', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.remove(req.params.id, (req.body || {}).token));
+});
+
+/** Add a way in. */
+app.put('/account-copy/:id/slots/:slotId', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.addSlot(req.params.id, req.params.slotId, req.body || {}));
+});
+
+/** Remove a way in (never the last). */
+app.post('/account-copy/:id/slots/:slotId/delete', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.removeSlot(req.params.id, req.params.slotId, (req.body || {}).token));
+});
+
+/** A way in: which copy it opens, and the account key sealed for it. Its own token only. */
+app.post('/account-slot/:slotId/read', (req, res) => {
+  if (!requireAccount(res)) return;
+  inviteReply(res, accountCopies.readSlot(req.params.slotId, (req.body || {}).token));
 });
 
 app.get('/.well-known/veilcore-registry', (_req, res) => {
