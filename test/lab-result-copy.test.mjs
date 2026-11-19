@@ -8,10 +8,10 @@
 // so was anything the breeder kept on it.
 //
 // The site now sends such a copy with the proof code inside its locked box only (records.ts
-// `copy`). That needs nothing new here, and opens nothing: to this registry the copy is a
-// sealed row with no proof code, so the first-holder rule never sees it, and no route that
-// reads a proof code (dating, deliveries, private lab signatures, /verify, deletion) ties the
-// lab's proof code to the breeder. These tests hold the registry to that, so a later change
+// `copy`), out of the clear and away from dating. That needs nothing new here, and leaves the
+// first-holder rule untouched: to this registry the copy is a sealed row with no proof code, and
+// no route that reads a stored row's proof code (dating, deliveries, private lab signatures,
+// /verify, deletion) gives the copy anything of the lab's. These tests hold the registry to that, so a later change
 // can't refuse such a row, or start reading a proof code from somewhere else.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -111,7 +111,7 @@ test('the breeder keeps a copy of the lab’s result; the proof code stays the l
   assert.match(stranger.json.rejected[0].reason, /already registered by another holder/);
 });
 
-test('a copy ties nothing of the lab’s proof code to the breeder', async () => {
+test('a copy gets nothing of the lab’s proof code from any route that reads a stored row', async () => {
   const lab = key(), breeder = key();
   const result = await labResult('lab-result-2');
   const F = result.recordFingerprint;
