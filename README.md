@@ -1684,10 +1684,51 @@ lab's, `POST /attesters/:key/vetting`), and the statement is a message held in a
 Receipts are served to anyone with the statement's fingerprint, which only the two parties
 and their partner know.
 
-## Passkey copies of backups
+## The account copy (one locked copy, several ways in)
 
-`lineage/passkey-vault.mjs`. A browser can keep an encrypted copy of a person's backup here,
-under a key only their passkey makes (WebAuthn PRF, then HKDF in the browser; site
+`lineage/account-copy.mjs`, from the site's "easy mode" step 2 (November 2026). It replaces one
+copy per passkey (below). The browser makes an account key once; the copy of the person's keys
+is sealed with it (padded to a power-of-two size in the browser); each way in is a "slot" that
+holds the account key sealed for that way in. Today the only kind made is `passkey` (WebAuthn
+PRF, then HKDF in the browser: site `veilcore/account-copy.ts`). `recovery`, `password` and
+`member` (another person of a shared space) are accepted kinds, so they come later without a
+migration. The site saves the copy by itself, at most every 30 to 60 quiet seconds.
+
+- `PUT /account-copy/:id` `{ token, prev, iv, ct, slot? }`: save over the copy this device last
+  saw (`prev`, its fingerprint, or `'none'`); 409 if another device saved since. The first save
+  must bring its first way in (`slot: { slotId, kind, tokenHash, iv, ct }`).
+- `POST /account-copy/:id/read` `{ token }`: the copy and its slots' ids and kinds.
+- `POST /account-copy/:id/head` `{ token }`: the copy's fingerprint, date and slots, without it.
+- `POST /account-copy/:id/delete` `{ token }`: the copy and every slot.
+- `PUT /account-copy/:id/slots/:slotId` `{ token, kind, tokenHash, iv, ct }`: add a way in.
+- `POST /account-copy/:id/slots/:slotId/delete` `{ token }`: remove one, never the last.
+- `POST /account-slot/:slotId/read` `{ token }` (the slot's own token): which copy it opens,
+  and the sealed account key.
+
+Two kinds of token. A slot's token reads that slot and nothing else. Everything else needs the
+copy's write token, which only the account key makes, so a leaked way in can't delete or replace
+the copy. Tokens travel in bodies, never URLs; the registry stores their SHA-256 only.
+
+Limits: 20 new copies per client (an IPv6 client by its /48) a UTC day; 500 saves and slot
+changes per copy a UTC day (counted per copy, not per address, so people behind one shared
+mobile address don't use up each other's); 20 slots a copy; about 2 MB of ciphertext.
+/health lists `account-copy-v1`.
+
+What the registry can see: which slots open which copy, the copy's size bucket, and when it is
+saved or checked. A save soon after a holder's record write from the same address lets it
+guess which holder a copy belongs to; the site waits a random few seconds before saving, which
+makes that harder, not impossible. It can't open the copy or a slot, and can't add a way in
+that works (that needs the account key). It can withhold or drop the copy or a slot, or keep
+serving an older one: the copy carries its own counter, date and list of slots inside the
+sealed part, and the site refuses an older copy, says when a slot is missing, and shows the
+date before a restore.
+
+## Passkey copies of backups (before the account copy)
+
+`lineage/passkey-vault.mjs`. Kept so copies made before the account copy can be read once and
+moved over (the site then deletes them here), and so a site build from before still works until
+the new one is live. A browser kept an encrypted copy of a person's backup here, under a key
+only their passkey makes (WebAuthn PRF, then HKDF in the browser; site
 `veilcore/passkey-backup.ts`). The registry holds an id, a write token's SHA-256 and the
 ciphertext: no account, no email, no passkey public key.
 
