@@ -21,7 +21,9 @@
 // Two kinds of token (security review S3): a slot's token only reads that slot's sealed
 // account key. Everything else (saving, reading or deleting the copy, adding or removing a
 // slot) needs the copy's own write token, which only the account key makes. So the token of a
-// way in that leaks (a phished password, later) can't delete or replace anything.
+// way in that leaks (a phished password, later) can't delete or replace anything. The write
+// token itself is an HMAC output made in the browser: a script bug there could read it once made
+// and use it later, until the site re-keys (site docs/passkey-backup.md, "re-key").
 //
 // What it can still do is withhold the copy, serve an older one it kept, or drop a slot. The
 // copy carries its own counter and date inside the sealed part, and its own list of slots (the

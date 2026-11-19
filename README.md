@@ -1707,7 +1707,8 @@ migration. The site saves the copy by itself, at most every 30 to 60 quiet secon
 
 Two kinds of token. A slot's token reads that slot and nothing else. Everything else needs the
 copy's write token, which only the account key makes, so a leaked way in can't delete or replace
-the copy. Tokens travel in bodies, never URLs; the registry stores their SHA-256 only.
+the copy. That token is made in the browser, where a script bug could read it once made; the
+site's `docs/passkey-backup.md` has the re-key procedure for after one. Tokens travel in bodies, never URLs; the registry stores their SHA-256 only.
 
 Limits: 20 new copies per client (an IPv6 client by its /48) a UTC day; 500 saves and slot
 changes per copy a UTC day (counted per copy, not per address, so people behind one shared
