@@ -12,7 +12,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { buildBatch } from 'veilcore-records';
-import { stampRoot, upgradeAnswer, otsFile, parseOtsFile, serialiseTimestamp, rootDigest, OtsError, DEFAULT_CALENDARS, DEFAULT_EXPLORER } from './ots.mjs';
+import { stampRoot, upgradeAnswer, otsFile, parseOtsFile, serialiseTimestamp, rootDigest, OtsError, DEFAULT_CALENDARS, explorersFrom } from './ots.mjs';
 
 /**
  * What a batch accepts as a commitment: exactly 64 lowercase hex characters. veilcore-records
@@ -431,7 +431,7 @@ export const createBatches = (db) => {
       for (const row of rows) {
         try {
           const out = await upgradeAnswer(row.answer, digest, {
-            calendars: DEFAULT_CALENDARS, explorer: process.env.VEILCORE_BTC_EXPLORER || DEFAULT_EXPLORER, ...options,
+            calendars: DEFAULT_CALENDARS, explorers: explorersFrom(process.env.VEILCORE_BTC_EXPLORER), ...options,
           });
           errors.push(...out.errors.map((e) => `${row.calendar}: ${e}`));
           if (out.bitcoin) {
@@ -480,6 +480,18 @@ export const createBatches = (db) => {
         bitcoinBlockHeight: b.ots_bitcoin_height ?? undefined,
         bitcoinBlockTime: b.ots_bitcoin_time ?? undefined,
       };
+    },
+
+    /**
+     * For /alerts `ots-behind` (reliability audit, 19 Nov 2026): a batch sealed in the last week,
+     * over a day ago, was sent for a Bitcoin stamp and is still not in a Bitcoin block. A
+     * calendar's transaction normally confirms within a few hours. Batches sealed while
+     * stamping was off (no status) don't count, nor do ones older than a week, so one old
+     * failure can't hold the alarm on for good.
+     */
+    otsBehind(now = Date.now()) {
+      return !!st(`SELECT 1 FROM batches WHERE ots_status IN ('requested', 'pending', 'failed')
+        AND sealed_at < ? AND sealed_at > ? LIMIT 1`).get(now - 24 * 3_600_000, now - 7 * 86_400_000);
     },
 
     /**
