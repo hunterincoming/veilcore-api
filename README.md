@@ -60,7 +60,7 @@ deployed.
 | `VEILCORE_OTS` | on | `off` disables automatic OpenTimestamps stamping on seal and the upkeep timer. The operator routes still work. |
 | `VEILCORE_OTS_INTERVAL_MS` | `1800000` (30 min) | How often the upkeep timer retries failed stamps and upgrades pending ones. |
 | `VEILCORE_TSA_URL` | unset | One RFC 3161 Time Stamping Authority, or up to five separated by commas or spaces, https (http only with a signer pin for that service). When set, every batch root gets a timestamp token from each within the hour, and each new proof code one from each within seconds (see "RFC 3161 timestamps"). Each is asked separately: one that is slow or down never holds up the others. Published with each token, so no query string or password. Unset: none. |
-| `VEILCORE_TSA_SIGNER_SHA256` | unset | SHA-256 fingerprint(s) of a TSA's signing certificate, comma separated. A token signed by any other certificate is refused. A plain fingerprint pins every service that has no pin of its own; `host=fingerprint` pins only the service at that host. Update it when a TSA renews its certificate (the alert `timestamps-behind` says when the first TSA's tokens stop). |
+| `VEILCORE_TSA_SIGNER_SHA256` | unset | SHA-256 fingerprint(s) of a TSA's signing certificate, comma separated. A token signed by any other certificate is refused. A plain fingerprint pins every service that has no pin of its own; `host=fingerprint` pins only the service at that host. With several TSAs, an http one needs its own `host=` pin: a shared pin would let someone on its path hand back another listed TSA's genuine token as this one's. Update it when a TSA renews its certificate (the alert `timestamps-behind` says when the first TSA's tokens stop). |
 | `VEILCORE_TSA_QUALIFIED_SCHEME` | unset | `eIDAS` (a qualified service on an EU trusted list) or `JP-MIC` (Japan's accredited time-stamping), for the first TSA in the list only, and only when the operator has checked that list. Published as `qualified: { scheme, trustedList }`; readers check the list themselves. |
 | `VEILCORE_TSA_TRUSTED_LIST` | unset | Where a reader checks that status (a URL). |
 | `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`), sent to the first TSA in the list only. A secret: Railway only. |
@@ -1891,11 +1891,13 @@ each TSA (`lineage/record-stamps.mjs`): the 32 raw bytes of the proof code, chec
 a batch root's token is. Taking the proof code never waits for a TSA: the queue is a database
 row, and the requests run after, one at a time per TSA, at least
 `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` apart, pausing longer after each failure (up to ten
-minutes). After three failed tries, `VEILCORE_TSA_RECORD_MAX_WAIT_MS` of waiting, or a full
-queue, that TSA gives that proof code none, and its batch's token dates it as before. A proof
-code whose record was deleted before its turn is dropped. Public:
+minutes). After three failed tries, `VEILCORE_TSA_RECORD_MAX_WAIT_MS` of waiting, a full
+queue, or 20 already waiting from the same holder (holder keys are free to make, so one key
+can't fill the queue for everyone), that TSA gives that proof code none, and its batch's token
+dates it as before. A proof code whose record was deleted before its turn is dropped, and a
+deleted or changed record's tokens are no longer served. Public:
 
-- `GET /proof/:commitment/instant`: 200 `{ status: "stamped", tokens: [{ kind: "rfc3161", token, tsa, genTime, qualified?, signer? }], stillAsking?, note }`, 202 `{ status: "queued" }`, or 404 `{ status: "batch" | "none" }`.
+- `GET /proof/:commitment/instant`: 200 `{ status: "stamped", tokens: [{ kind: "rfc3161", token, tsa, genTime, qualified?, signer? }], stillAsking?, note }`, 202 `{ status: "queued" }`, or 404 `{ status: "none" }` (none of its own, never taken, or no record carries it now: one answer for all three).
 - `GET /proof/:commitment/instant.tst?tsa=<address>`: one token as DER, for
   `openssl ts -verify -data <proof code as 32 raw bytes> -in instant.tst -token_in -CAfile <chain>`.
 

@@ -98,10 +98,16 @@ export const tsaConfig = (env = process.env) => {
     } catch {
       return { error: `VEILCORE_TSA_URL is not a URL (${i + 1} in the list)` };
     }
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return { error: 'VEILCORE_TSA_URL must be https' };
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return { error: 'VEILCORE_TSA_URL must be https (http only with a signer pin)' };
     if (u.username || u.password || u.search) return { error: 'VEILCORE_TSA_URL must carry no password or query (it is published); use VEILCORE_TSA_AUTHORIZATION' };
     if (services.some((s) => s.url === u.href)) return { error: `VEILCORE_TSA_URL lists ${u.host} twice` };
-    const pins = scoped.get(u.host.toLowerCase()) ?? scoped.get(u.hostname.toLowerCase()) ?? plain;
+    const own = scoped.get(u.host.toLowerCase()) ?? scoped.get(u.hostname.toLowerCase());
+    const pins = own ?? plain;
+    // Several TSAs: an http one needs a pin of its own (security review, 19 Nov 2026). With a
+    // pin shared by all, someone on the path to it could pass the request to another listed TSA
+    // and its genuine token would be kept as this one's: two "independent" timestamps, one source.
+    if (u.protocol === 'http:' && urls.length > 1 && !own)
+      return { error: `with several TSAs, the http one (${u.host}) needs its own pin: VEILCORE_TSA_SIGNER_SHA256=${u.host}=<fingerprint>` };
     const auth = i === 0 ? authorization : undefined;
     if (u.protocol === 'http:' && pins.length === 0) return { error: `an http TSA needs VEILCORE_TSA_SIGNER_SHA256 (${u.host})` };
     if (u.protocol === 'http:' && auth) return { error: 'VEILCORE_TSA_AUTHORIZATION needs an https TSA' };

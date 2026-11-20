@@ -171,7 +171,7 @@ test('waited too long, or the queue is full: its batch’s token instead; a dele
   const db = new Database(':memory:');
   const c = clock();
   const tsa = fakeTsa();
-  const held = new Set(['VEIL-A', 'VEIL-B']);
+  const held = new Set(['VEIL-A', 'VEIL-B', 'VEIL-D']);
   const s = createRecordStamps(db, {
     request: tsa.request,
     now: c.now,
@@ -239,7 +239,13 @@ test('the TSA setting takes a list; a single address reads as before; pins can b
   assert.deepEqual(list.services.map((x) => x.pins), [[], [], [pin2]], 'a scoped pin pins only its own service');
   assert.deepEqual(list.services.map((x) => x.qualified?.scheme ?? null), ['eIDAS', null, null], 'stated for the first only');
   assert.deepEqual(list.services.map((x) => x.authorization ?? null), ['Basic x', null, null], 'sent to the first only');
-  assert.match(tsaConfig({ VEILCORE_TSA_URL: 'https://freetsa.org/tsr http://timestamp.digicert.com' }).error, /http TSA needs/);
+  assert.match(tsaConfig({ VEILCORE_TSA_URL: 'https://freetsa.org/tsr http://timestamp.digicert.com' }).error, /needs its own pin/);
+  // A pin shared by all doesn't do for an http TSA among several: its own, by host.
+  assert.match(
+    tsaConfig({ VEILCORE_TSA_URL: 'https://freetsa.org/tsr http://timestamp.digicert.com', VEILCORE_TSA_SIGNER_SHA256: pin }).error,
+    /needs its own pin/,
+  );
+  assert.equal(tsaConfig({ VEILCORE_TSA_URL: 'http://timestamp.digicert.com', VEILCORE_TSA_SIGNER_SHA256: pin }).error, undefined, 'alone, as before');
   assert.deepEqual(tsaConfig({ VEILCORE_TSA_URL: 'https://a.example/ https://b.example/', VEILCORE_TSA_SIGNER_SHA256: pin }).services.map((x) => x.pins), [[pin], [pin]], 'a plain pin still pins every service');
   assert.match(tsaConfig({ VEILCORE_TSA_URL: 'https://a.example/', VEILCORE_TSA_SIGNER_SHA256: `b.example=${pin}` }).error, /doesn't list/);
   assert.match(tsaConfig({ VEILCORE_TSA_URL: 'https://a.example/ https://a.example/' }).error, /twice/);
@@ -272,6 +278,38 @@ test('several TSAs on a batch: the first one’s token where it always was, the 
   assert.deepEqual(tsas.map((x) => x.tsa), [one.url, two.url]);
   assert.equal(tsas[1].tst, `/batches/B-2/root.tst?tsa=${encodeURIComponent(two.url)}`);
   assert.deepEqual(await batches.tsaMaintenance({ ...one, services: [one, two] }, { request }), [], 'each is stamped once');
+  db.close();
+});
+
+test('one holder can’t fill the queue: past its share, its proof codes go to the batch', async () => {
+  const db = new Database(':memory:');
+  const c = clock();
+  const tsa = fakeTsa();
+  const s = createRecordStamps(db, { request: tsa.request, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer, maxPerHolder: 2 });
+  s.configure(CFG);
+  const flood = Array.from({ length: 5 }, (_, i) => ({ id: `VEIL-F${i}`, commitment: String(i).repeat(64) }));
+  assert.equal(s.enqueue(flood, 'holder-flood'), 5);
+  assert.deepEqual(flood.map((f) => s.instantFor(f.commitment).status), ['queued', 'queued', 'batch', 'batch', 'batch']);
+  // Someone else's record still gets its turn.
+  const other = 'e7'.repeat(32);
+  s.enqueue([{ id: 'VEIL-O', commitment: other }], 'holder-other');
+  assert.deepEqual(s.instantFor(other), { status: 'queued' });
+  db.close();
+});
+
+test('a deleted record’s timestamp is not served', async () => {
+  const db = new Database(':memory:');
+  const c = clock();
+  const tsa = fakeTsa();
+  const held = new Set(['VEIL-A']);
+  const s = createRecordStamps(db, { request: tsa.request, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer, minIntervalMs: 0, stillHeld: (id) => held.has(id) });
+  s.configure(CFG);
+  const a = 'a5'.repeat(32);
+  s.enqueue([{ id: 'VEIL-A', commitment: a }]);
+  await c.fire();
+  assert.equal(s.instantFor(a).status, 'stamped');
+  held.delete('VEIL-A');
+  assert.equal(s.instantFor(a), null);
   db.close();
 });
 

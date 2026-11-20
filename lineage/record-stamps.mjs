@@ -67,6 +67,7 @@ export const createRecordStamps = (
     minIntervalMs = 2_000,
     maxWaitMs = 30 * 60_000,
     maxQueue = 1_000,
+    maxPerHolder = 20,
     maxAttempts = 3,
     backoffMs = 30_000,
     maxBackoffMs = 10 * 60_000,
@@ -84,6 +85,7 @@ export const createRecordStamps = (
       commitment TEXT NOT NULL,
       tsa_url TEXT NOT NULL,
       record_id TEXT NOT NULL,
+      holder TEXT,
       state TEXT NOT NULL,
       queued_at INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -96,13 +98,15 @@ export const createRecordStamps = (
       PRIMARY KEY (commitment, tsa_url)
     );
     CREATE INDEX IF NOT EXISTS record_timestamps_queue ON record_timestamps (tsa_url, state, queued_at);
+    CREATE INDEX IF NOT EXISTS record_timestamps_holder ON record_timestamps (holder, tsa_url, state);
   `);
   const st = (sql) => db.prepare(sql);
   const insert = st(
-    `INSERT INTO record_timestamps (commitment, tsa_url, record_id, state, queued_at, error) VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO record_timestamps (commitment, tsa_url, record_id, holder, state, queued_at, error) VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(commitment, tsa_url) DO NOTHING`,
   );
   const waiting = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE tsa_url = ? AND state = 'queued'`);
+  const waitingFor = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE holder = ? AND tsa_url = ? AND state = 'queued'`);
   const next = st(`SELECT commitment, record_id, queued_at, attempts FROM record_timestamps
     WHERE tsa_url = ? AND state = 'queued' ORDER BY queued_at, commitment LIMIT 1`);
   const toBatch = st(`UPDATE record_timestamps SET state = 'batch', error = ? WHERE commitment = ? AND tsa_url = ? AND state = 'queued'`);
@@ -217,8 +221,11 @@ export const createRecordStamps = (
     /**
      * Queue these proof codes for a token from each TSA. Synchronous and cheap: never awaits a
      * TSA. A proof code already queued or stamped there is left as it is. `items`: [{ id, commitment }].
+     * `holder`: the holder's stored key. One holder has at most `maxPerHolder` waiting per TSA
+     * (security review, 19 Nov 2026: holder keys are free to make, so a flood from one key, or a
+     * few, must not fill the queue and leave everyone else to the batch); the rest go to the batch.
      */
-    enqueue(items) {
+    enqueue(items, holder = null) {
       if (lanes.length === 0 || !Array.isArray(items) || items.length === 0) return 0;
       const ok = items.filter((it) => it && typeof it.id === 'string' && typeof it.commitment === 'string' && HEX64.test(it.commitment));
       if (ok.length === 0) return 0;
@@ -228,13 +235,16 @@ export const createRecordStamps = (
       db.transaction(() => {
         for (const lane of lanes) {
           let room = maxQueue - waiting.get(lane.svc.url).n;
+          let mine = holder ? maxPerHolder - waitingFor.get(holder, lane.svc.url).n : maxPerHolder;
           for (const it of ok) {
-            const full = room <= 0;
-            const info = insert.run(it.commitment, lane.svc.url, it.id, full ? 'batch' : 'queued', t, full ? 'the queue was full; its batch is timestamped instead' : null);
+            const full = room <= 0 || mine <= 0;
+            const why = room <= 0 ? 'the queue was full; its batch is timestamped instead' : 'this holder had many waiting; its batch is timestamped instead';
+            const info = insert.run(it.commitment, lane.svc.url, it.id, holder, full ? 'batch' : 'queued', t, full ? why : null);
             if (info.changes) {
               added++;
               if (!full) {
                 room--;
+                mine--;
                 touched.add(lane);
               }
             }
@@ -254,6 +264,9 @@ export const createRecordStamps = (
       if (!HEX64.test(String(commitment))) return null;
       const rows = rowsOf.all(commitment);
       if (rows.length === 0) return null;
+      // Only while a record still carries this proof code: a deleted or changed record's tokens
+      // are not served (security review, 19 Nov 2026).
+      if (!rows.some((r) => stillHeld(r.record_id, r.commitment))) return null;
       const tokens = rows
         .filter((r) => r.state === 'stamped' && r.token)
         .map((r) => ({

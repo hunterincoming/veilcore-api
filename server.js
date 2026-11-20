@@ -1683,7 +1683,7 @@ app.put('/api/records', (req, res) => {
   // queued only, after the save is written. Never awaited, and never a reason to fail the save.
   if (outcome === 'ok' && toStamp.length) {
     try {
-      recordStamps?.enqueue(toStamp);
+      recordStamps?.enqueue(toStamp, holder);
     } catch (e) {
       console.error('record timestamp queue failed:', e.message);
     }
@@ -1812,7 +1812,7 @@ app.put('/api/records/dating', (req, res) => {
   // Queued only (lineage/record-stamps.mjs): never awaited, never a reason to fail the request.
   if (newProofCodes.length) {
     try {
-      recordStamps?.enqueue(newProofCodes);
+      recordStamps?.enqueue(newProofCodes, holder);
     } catch (e) {
       console.error('record timestamp queue failed:', e.message);
     }
@@ -3474,8 +3474,9 @@ app.get('/proof/:commitment', (req, res) => {
  *   200 { status: 'stamped', stamps, tokens: [{ kind: 'rfc3161', token, tsa, genTime, qualified?, signer? }],
  *         stillAsking?, note }   one token per TSA that has answered (VEILCORE_TSA_URL may list several)
  *   202 { status: 'queued' }      asked for, none back yet
- *   404 { status: 'batch' }       none of its own: its batch's token (/batches/:id/root.tst) dates it
- *   404 { status: 'none' }        no TSA set, or a proof code this registry never queued
+ *   404 { status: 'none' }        none of its own (its batch's token dates it), no TSA set, a proof
+ *                                 code this registry never took, or one no record carries now: the
+ *                                 same answer for each, so it says nothing about which
  */
 app.get('/proof/:commitment/instant', (req, res) => {
   if (!/^[0-9a-f]{64}$/.test(req.params.commitment)) return res.status(400).json({ error: 'a proof code is 64 lowercase hex characters' });
@@ -3483,7 +3484,7 @@ app.get('/proof/:commitment/instant', (req, res) => {
   const out = recordStamps.instantFor(req.params.commitment);
   if (!out) return res.status(404).json({ status: 'none' });
   if (out.status === 'queued') return res.status(202).json(out);
-  if (out.status === 'batch') return res.status(404).json(out);
+  if (out.status === 'batch') return res.status(404).json({ status: 'none' });
   res.json(out);
 });
 
