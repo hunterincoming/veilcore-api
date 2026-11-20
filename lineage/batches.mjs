@@ -116,6 +116,22 @@ export const createBatches = (db) => {
     if (!cols.has(name)) db.exec(`ALTER TABLE batches ADD COLUMN ${name} ${type}`);
   }
 
+  // 19 November 2026 (reliability audit): tokens from the second and later TSAs in
+  // VEILCORE_TSA_URL, one row per batch and TSA. The first TSA's token stays in the columns
+  // above, as before, so every reader of a single token is unchanged.
+  db.exec(`CREATE TABLE IF NOT EXISTS batch_timestamps (
+    batch_id TEXT NOT NULL,
+    tsa_url TEXT NOT NULL,
+    token BLOB,
+    tsa_qualified TEXT,
+    gen_time TEXT,
+    signer TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    tried_at INTEGER,
+    PRIMARY KEY (batch_id, tsa_url)
+  )`);
+
   // Every statement is prepared once, on first use (a records table without holder_key,
   // as in some tests, must not stop the rest from working).
   const cache = new Map();
@@ -209,12 +225,34 @@ export const createBatches = (db) => {
     };
   };
 
+  // Prepared once here, not on first use: an export prepares a fixed number of statements
+  // whatever it holds (attack-ots.test.mjs).
+  const otherTsaRows = db.prepare('SELECT * FROM batch_timestamps WHERE batch_id = ? AND token IS NOT NULL ORDER BY tsa_url');
+  /** The tokens from the second and later TSAs, as rfc3161 entries, in the order of their URLs. */
+  const otherTsaEntries = (b) => {
+    if (!b?.batch_id) return [];
+    return otherTsaRows.all(b.batch_id).map((t) => ({
+      kind: 'rfc3161',
+      token: Buffer.from(t.token).toString('base64'),
+      tsa: t.tsa_url,
+      ...(qualifiedOf(t.tsa_qualified) ? { qualified: qualifiedOf(t.tsa_qualified) } : {}),
+      genTime: t.gen_time,
+      ...(t.signer ? { signer: t.signer } : {}),
+      stamps: 'the batch root as 32 raw bytes (root.bin)',
+      tst: `/batches/${b.batch_id}/root.tst?tsa=${encodeURIComponent(t.tsa_url)}`,
+      ...(Date.parse(t.gen_time) - b.sealed_at > 2 * 3_600_000 ? { requestedAfterSeal: true } : {}),
+      note: 'Shows the batch root existed by genTime, the time the TSA states; nothing earlier. Whether the TSA is qualified is checked on the trusted list named, not here.',
+    }));
+  };
+
   /** A stored proof with the batch's anchors folded in. */
   const foldAnchors = (proof, b) => {
     if (b?.anchor) proof.anchor = describeAnchor(JSON.parse(b.anchor));
     const ots = b ? otsEntry(b) : null;
     const tsa = tsaEntry(b);
-    if (ots || tsa) proof.anchors = [...(proof.anchor ? [{ kind: 'ledger', ...proof.anchor }] : []), ...(ots ? [ots] : []), ...(tsa ? [tsa] : [])];
+    const others = otherTsaEntries(b);
+    if (ots || tsa || others.length)
+      proof.anchors = [...(proof.anchor ? [{ kind: 'ledger', ...proof.anchor }] : []), ...(ots ? [ots] : []), ...(tsa ? [tsa] : []), ...others];
     return proof;
   };
 
@@ -552,6 +590,8 @@ export const createBatches = (db) => {
               }
             : { available: false, status: b.ots_status ?? 'none' },
           rfc3161: tsaEntry(b) ?? { available: false },
+          // From the second and later TSAs (VEILCORE_TSA_URL lists several): each its own token.
+          ...(otherTsaEntries(b).length ? { rfc3161Others: otherTsaEntries(b) } : {}),
         },
       };
     },
@@ -565,11 +605,16 @@ export const createBatches = (db) => {
       return !!st('SELECT 1 FROM batches WHERE tsa_token IS NULL AND sealed_at < ? AND sealed_at > ? LIMIT 1').get(t - 3 * 3_600_000, t - 7 * 86_400_000);
     },
 
-    /** The stored RFC 3161 token for a batch (DER), or null; undefined for no such batch. */
-    tsaFor(batchId) {
-      const b = st('SELECT tsa_token, tsa_error FROM batches WHERE batch_id = ?').get(batchId);
+    /**
+     * The stored RFC 3161 token for a batch (DER), or null; undefined for no such batch. With
+     * `tsaUrl`, the token from that TSA (the first one's, or a later one's).
+     */
+    tsaFor(batchId, tsaUrl) {
+      const b = st('SELECT tsa_token, tsa_error, tsa_url FROM batches WHERE batch_id = ?').get(batchId);
       if (!b) return undefined;
-      return { token: b.tsa_token ? Buffer.from(b.tsa_token) : null, error: b.tsa_error };
+      if (tsaUrl === undefined || tsaUrl === b.tsa_url) return { token: b.tsa_token ? Buffer.from(b.tsa_token) : null, error: b.tsa_error };
+      const t = st('SELECT token, error FROM batch_timestamps WHERE batch_id = ? AND tsa_url = ?').get(batchId, tsaUrl);
+      return { token: t?.token ? Buffer.from(t.token) : null, error: t?.error ?? null };
     },
 
     /**
@@ -579,8 +624,18 @@ export const createBatches = (db) => {
      * a TSA was set gets a token dated now: the token says when it was made (requestedAfterSeal).
      */
     async tsaMaintenance(cfg, { request, limit = 50 } = {}) {
+      if (!cfg?.url) return [];
+      // Several TSAs (tsa.mjs tsaConfig `services`): each asked separately and at the same time,
+      // so one that is slow or down never holds up the others. The first one's token goes where
+      // it always went; the others' into batch_timestamps.
+      const services = Array.isArray(cfg.services) && cfg.services.length ? cfg.services : [cfg];
+      const all = await Promise.all(services.map((svc, i) => (i === 0 ? this.tsaPrimary(svc, { request, limit }) : this.tsaOther(svc, { request, limit }))));
+      return all.flat();
+    },
+
+    /** The first TSA: its token in the batches table, as before several were allowed. */
+    async tsaPrimary(cfg, { request, limit = 50 } = {}) {
       const out = [];
-      if (!cfg?.url) return out;
       const day = Date.now() - 86_400_000;
       const due = st(`SELECT batch_id, root FROM batches WHERE tsa_token IS NULL
         AND (tsa_attempts < 5 OR tsa_tried_at IS NULL OR tsa_tried_at < ? OR tsa_tried_url IS NOT ?)
@@ -602,6 +657,36 @@ export const createBatches = (db) => {
         st('UPDATE batches SET tsa_token = ?, tsa_url = ?, tsa_qualified = ?, tsa_gen_time = ?, tsa_signer = ?, tsa_error = NULL WHERE batch_id = ? AND tsa_token IS NULL')
           .run(Buffer.from(r.token, 'base64'), cfg.url, cfg.qualified ? JSON.stringify(cfg.qualified) : null, r.genTime, r.signerSubject ?? null, b.batch_id);
         out.push({ batchId: b.batch_id, genTime: r.genTime });
+      }
+      return out;
+    },
+
+    /** A second or later TSA: its token in batch_timestamps, with the same tries as the first. */
+    async tsaOther(cfg, { request, limit = 50 } = {}) {
+      const out = [];
+      const day = Date.now() - 86_400_000;
+      const due = st(`SELECT b.batch_id, b.root FROM batches b
+        LEFT JOIN batch_timestamps t ON t.batch_id = b.batch_id AND t.tsa_url = ?
+        WHERE t.token IS NULL AND (t.attempts IS NULL OR t.attempts < 5 OR t.tried_at IS NULL OR t.tried_at < ?)
+        ORDER BY b.sealed_at LIMIT ?`).all(cfg.url, day, limit);
+      for (const b of due) {
+        st(`INSERT INTO batch_timestamps (batch_id, tsa_url, attempts, tried_at) VALUES (?, ?, 1, ?)
+          ON CONFLICT(batch_id, tsa_url) DO UPDATE SET attempts = attempts + 1, tried_at = excluded.tried_at`).run(b.batch_id, cfg.url, Date.now());
+        let r;
+        try {
+          r = await request(b.root, cfg);
+        } catch {
+          r = { error: 'the request failed' };
+        }
+        if (r.error) {
+          st('UPDATE batch_timestamps SET error = ? WHERE batch_id = ? AND tsa_url = ?').run(r.error, b.batch_id, cfg.url);
+          out.push({ batchId: b.batch_id, tsa: cfg.url, error: r.error });
+          continue;
+        }
+        st(`UPDATE batch_timestamps SET token = ?, tsa_qualified = ?, gen_time = ?, signer = ?, error = NULL
+          WHERE batch_id = ? AND tsa_url = ? AND token IS NULL`)
+          .run(Buffer.from(r.token, 'base64'), cfg.qualified ? JSON.stringify(cfg.qualified) : null, r.genTime, r.signerSubject ?? null, b.batch_id, cfg.url);
+        out.push({ batchId: b.batch_id, tsa: cfg.url, genTime: r.genTime });
       }
       return out;
     },
@@ -664,6 +749,7 @@ export const createBatches = (db) => {
             note: ots.note,
           } : null,
           rfc3161: tsaEntry(b),
+          ...(otherTsaEntries(b).length ? { rfc3161Others: otherTsaEntries(b) } : {}),
         };
       });
       return { byId, batches };
