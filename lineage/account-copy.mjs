@@ -52,7 +52,7 @@ export const ACCOUNT_LIMITS = {
   perCopyWritesDaily: 500,
 };
 
-/** What a slot can be. Only "passkey" is made today; the rest are reserved so they need no migration. */
+/** What a slot can be. "passkey" and "recovery" (a printed recovery sheet) are made; the rest are reserved so they need no migration. */
 export const SLOT_KINDS = new Set(['passkey', 'recovery', 'password', 'member']);
 
 const ID = /^[0-9a-f]{32}$/;
@@ -123,10 +123,15 @@ export const createAccountCopies = (db, { now = () => Date.now(), limits = {} } 
     return { row };
   };
 
+  // Each slot with the fingerprint of its sealed account key (`wrap`, as copyFingerprint): the
+  // browser records it inside the sealed copy when it opens that way in, and compares it on every
+  // check, so a slot whose stored wrap was changed or damaged here is noticed without waiting for
+  // a restore (site review of step 2: "re-verify a way in"). It reveals nothing the slot read
+  // doesn't: a hash of ciphertext only the way in's own key opens.
   const slotsOf = (id) =>
-    st('SELECT slot_id, kind, created_at FROM account_slots WHERE copy_id = ? ORDER BY created_at, slot_id')
+    st('SELECT slot_id, kind, iv, ct, created_at FROM account_slots WHERE copy_id = ? ORDER BY created_at, slot_id')
       .all(id)
-      .map((s) => ({ slotId: s.slot_id, kind: s.kind, createdAt: s.created_at }));
+      .map((s) => ({ slotId: s.slot_id, kind: s.kind, createdAt: s.created_at, wrap: copyFingerprint(s.iv, s.ct) }));
 
   /** A slot as a save or an add sends it; an error, or the fields to store. */
   const slotIn = (slot) => {
@@ -209,7 +214,7 @@ export const createAccountCopies = (db, { now = () => Date.now(), limits = {} } 
       return { saved: true, updatedAt: at, fingerprint: copyFingerprint(iv, ct) };
     },
 
-    /** The copy and its slots' ids and kinds, with the write token (a POST: no token in a URL). */
+    /** The copy and its slots' ids, kinds and wrap fingerprints, with the write token (a POST: no token in a URL). */
     read(id, token) {
       const a = owned(id, token);
       if (a.error) return a;
