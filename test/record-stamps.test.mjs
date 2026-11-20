@@ -85,10 +85,17 @@ const fakeTsa = () => {
 const CFG = { url: 'https://tsa.example/', pins: [], qualified: null };
 
 test('settings: on unless VEILCORE_TSA_RECORDS=off; out-of-range numbers use the defaults', () => {
-  assert.deepEqual(recordStampSettings({}), { on: true, minIntervalMs: 2000, maxWaitMs: 1_800_000, maxQueue: 1000 });
+  assert.deepEqual(recordStampSettings({}), {
+    on: true,
+    minIntervalMs: 15_000,
+    maxWaitMs: 1_800_000,
+    maxQueue: 1000,
+    perHolderPerDay: 200,
+    perTsaPerDay: 5000,
+  });
   assert.equal(recordStampSettings({ VEILCORE_TSA_RECORDS: 'OFF' }).on, false);
   assert.equal(recordStampSettings({ VEILCORE_TSA_RECORD_MIN_INTERVAL_MS: '15000' }).minIntervalMs, 15000);
-  assert.equal(recordStampSettings({ VEILCORE_TSA_RECORD_MIN_INTERVAL_MS: '-1' }).minIntervalMs, 2000);
+  assert.equal(recordStampSettings({ VEILCORE_TSA_RECORD_MIN_INTERVAL_MS: '-1' }).minIntervalMs, 15_000);
   assert.equal(recordStampSettings({ VEILCORE_TSA_RECORD_MAX_QUEUE: 'lots' }).maxQueue, 1000);
 });
 
@@ -297,6 +304,50 @@ test('one holder can’t fill the queue: past its share, its proof codes go to t
   db.close();
 });
 
+test('a day’s budget per holder and per TSA: past it, the batch’s token instead', async () => {
+  const db = new Database(':memory:');
+  const c = clock();
+  const tsa = fakeTsa();
+  const s = createRecordStamps(db, { request: tsa.request, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer, minIntervalMs: 0, perHolderPerDay: 3, perTsaPerDay: 5 });
+  s.configure(CFG);
+  const code = (i) => i.toString(16).padStart(64, 'f');
+  // One holder, draining as fast as it refills: three a day, then the batch.
+  for (let i = 0; i < 5; i++) {
+    s.enqueue([{ id: `VEIL-H${i}`, commitment: code(i) }], 'holder-a');
+    await c.fire();
+  }
+  assert.deepEqual([0, 1, 2, 3, 4].map((i) => s.instantFor(code(i)).status), ['stamped', 'stamped', 'stamped', 'batch', 'batch']);
+  // The TSA's own day: five in all, whoever asks.
+  for (let i = 10; i < 14; i++) s.enqueue([{ id: `VEIL-O${i}`, commitment: code(i) }], `holder-${i}`);
+  assert.deepEqual([10, 11, 12, 13].map((i) => s.instantFor(code(i)).status), ['queued', 'queued', 'batch', 'batch']);
+  // A day later, room again.
+  c.advance(86_400_001);
+  s.enqueue([{ id: 'VEIL-H9', commitment: code(9) }], 'holder-a');
+  assert.equal(s.instantFor(code(9)).status, 'queued');
+  db.close();
+});
+
+test('a deleted record’s timestamps go: not served, not kept', async () => {
+  const db = new Database(':memory:');
+  const c = clock();
+  const tsa = fakeTsa();
+  const s = createRecordStamps(db, { request: tsa.request, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer, minIntervalMs: 0 });
+  s.configure(CFG);
+  const [a, b] = ['a6', 'b6'].map((x) => x.repeat(32));
+  s.enqueue([{ id: 'VEIL-A', commitment: a }]);
+  await c.fire();
+  assert.ok(s.tokenFor(a));
+  // Its proof code changed: the old one's rows go.
+  assert.equal(s.forgetRecord('VEIL-A', b), 1);
+  assert.equal(s.instantFor(a), null);
+  assert.equal(s.tokenFor(a), null);
+  s.enqueue([{ id: 'VEIL-A', commitment: b }]);
+  await c.fire();
+  assert.equal(s.forgetRecord('VEIL-A'), 1, 'deleted: every row');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM record_timestamps').get().n, 0);
+  db.close();
+});
+
 test('a deleted record’s timestamp is not served', async () => {
   const db = new Database(':memory:');
   const c = clock();
@@ -310,6 +361,7 @@ test('a deleted record’s timestamp is not served', async () => {
   assert.equal(s.instantFor(a).status, 'stamped');
   held.delete('VEIL-A');
   assert.equal(s.instantFor(a), null);
+  assert.equal(s.tokenFor(a), null, 'nor as instant.tst');
   db.close();
 });
 
@@ -462,6 +514,20 @@ test('a saved record with a new proof code is stamped; saving it again with the 
   assert.equal(again.json.ok, true, JSON.stringify(again.json));
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(tsa.asked, before, 'the same proof code is not stamped twice');
+});
+
+test('deleting the record deletes its timestamps, in the same request', async () => {
+  tsa.mode = 'ok';
+  const holder = hex();
+  const id = recordId();
+  const fp = hex();
+  await call('PUT', '/api/records/dating', holder, [{ id, recordFingerprint: fp }]);
+  assert.equal((await stampedSoon(fp)).status, 200);
+  const gone = await call('DELETE', '/api/records', holder, { ids: [id] });
+  assert.deepEqual(gone.json.removed, [id], JSON.stringify(gone.json));
+  assert.equal((await call('GET', `/proof/${fp}/instant`)).status, 404);
+  assert.equal((await call('GET', `/proof/${fp}/instant.tst`)).status, 404);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM record_timestamps WHERE commitment = ?').get(fp).n, 0);
 });
 
 test('a TSA that hangs or refuses never holds up or fails taking a proof code', async () => {

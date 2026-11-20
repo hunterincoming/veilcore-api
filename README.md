@@ -65,7 +65,9 @@ deployed.
 | `VEILCORE_TSA_TRUSTED_LIST` | unset | Where a reader checks that status (a URL). |
 | `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`), sent to the first TSA in the list only. A secret: Railway only. |
 | `VEILCORE_TSA_RECORDS` | on | `off` stops the per-record tokens (batches are still stamped). |
-| `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` | `2000` | The least time between two per-record requests to the same TSA. Some free TSAs ask for 15 seconds (`15000`). |
+| `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` | `15000` | The least time between two per-record requests to the same TSA: by default the strictest free TSA's (Sectigo asks for 15 seconds). Lower it only for a TSA whose terms allow more. |
+| `VEILCORE_TSA_RECORD_PER_HOLDER_PER_DAY` | `200` | Per-record requests one holder can cause per TSA in 24 hours. Past it, the batch's token. |
+| `VEILCORE_TSA_RECORD_PER_TSA_PER_DAY` | `5000` | Per-record requests to one TSA in 24 hours, from everyone. Keeps a paid TSA's bill bounded and a free one's limits for the batch roots, which are asked separately and hourly. |
 | `VEILCORE_TSA_RECORD_MAX_WAIT_MS` | 30 minutes | A proof code still waiting this long gets no token of its own from that TSA; its batch's token dates it. |
 | `VEILCORE_TSA_RECORD_MAX_QUEUE` | `1000` | Per TSA. A proof code arriving while this many wait is left to its batch's token. |
 | `VEILCORE_BTC_EXPLORER` | `https://blockstream.info/api` | Esplora API used to fetch Bitcoin block headers when checking an upgraded proof. |
@@ -1879,9 +1881,15 @@ DigiCert is plain http, so it needs its own pin, read from a token it issued):
 
 ```
 VEILCORE_TSA_URL=https://freetsa.org/tsr https://timestamp.sectigo.com http://timestamp.digicert.com
-VEILCORE_TSA_SIGNER_SHA256=timestamp.digicert.com=<SHA-256 of DigiCert's TSA signing certificate>
-VEILCORE_TSA_RECORD_MIN_INTERVAL_MS=15000
+VEILCORE_TSA_SIGNER_SHA256=freetsa.org=32e841a95cc1164101ffde41298ef2fc75c1c4372ef095e88a6bbd47dfb191fc,timestamp.digicert.com=4aa03fa22cd75c84c55c938f828e676b9caecab33fe36d269aa334f146110a33,timestamp.digicert.com=2da09da7f4131f9fe72db6c5e6e9c9656755af043f1ea742cc0d2120e141ebfc
 ```
+
+These are the signing certificates the site pins (veilcore `bboard-ui/src/config/tsa-pins.json`,
+with how each was checked, and copies in `docs/tsa-pins/`). Sectigo's isn't there yet: its
+current signer couldn't be checked from a second source, so the site shows no Sectigo token
+until one is added (`node scripts/tsa-pin.mjs https://timestamp.sectigo.com` in the site repo).
+A TSA that rotates its certificate stops matching: its tokens are then refused here and not
+shown on the site, and both pins need the new certificate.
 
 ### A token for each record, in seconds
 
@@ -1892,10 +1900,13 @@ a batch root's token is. Taking the proof code never waits for a TSA: the queue 
 row, and the requests run after, one at a time per TSA, at least
 `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` apart, pausing longer after each failure (up to ten
 minutes). After three failed tries, `VEILCORE_TSA_RECORD_MAX_WAIT_MS` of waiting, a full
-queue, or 20 already waiting from the same holder (holder keys are free to make, so one key
-can't fill the queue for everyone), that TSA gives that proof code none, and its batch's token
-dates it as before. A proof code whose record was deleted before its turn is dropped, and a
-deleted or changed record's tokens are no longer served. Public:
+queue, 20 already waiting from the same holder, or a day's budget used (per holder and per
+TSA, see the settings; holder keys are free to make, so a script refilling the queue all day
+would otherwise run up a paid TSA's bill or get the registry's address limited by a free one,
+batch roots included), that TSA gives that proof code none, and its batch's token dates it as
+before. A proof code whose record was deleted before its turn is dropped. When a record is
+deleted, or its proof code changes, its timestamp rows are deleted in the same transaction, and
+nothing is served for a proof code no record carries. Public:
 
 - `GET /proof/:commitment/instant`: 200 `{ status: "stamped", tokens: [{ kind: "rfc3161", token, tsa, genTime, qualified?, signer? }], stillAsking?, note }`, 202 `{ status: "queued" }`, or 404 `{ status: "none" }` (none of its own, never taken, or no record carries it now: one answer for all three).
 - `GET /proof/:commitment/instant.tst?tsa=<address>`: one token as DER, for

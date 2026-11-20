@@ -47,9 +47,15 @@ export const recordStampSettings = (env = process.env) => {
   };
   return {
     on: String(env.VEILCORE_TSA_RECORDS ?? '').trim().toLowerCase() !== 'off',
-    minIntervalMs: int('VEILCORE_TSA_RECORD_MIN_INTERVAL_MS', 2_000, 0, 600_000),
+    // The strictest free TSA's pace (Sectigo asks 15 s between requests) unless set (TSA-3).
+    minIntervalMs: int('VEILCORE_TSA_RECORD_MIN_INTERVAL_MS', 15_000, 0, 600_000),
     maxWaitMs: int('VEILCORE_TSA_RECORD_MAX_WAIT_MS', 30 * 60_000, 1_000, 24 * 3_600_000),
     maxQueue: int('VEILCORE_TSA_RECORD_MAX_QUEUE', 1_000, 1, 100_000),
+    // A day's budget, per holder and per TSA (security review of PR #145, TSA-3): holder keys are
+    // free, so caps on what waits alone let a script refill them all day, running up a paid
+    // TSA's bill or getting the registry's address limited by a free one, batch roots included.
+    perHolderPerDay: int('VEILCORE_TSA_RECORD_PER_HOLDER_PER_DAY', 200, 1, 1_000_000),
+    perTsaPerDay: int('VEILCORE_TSA_RECORD_PER_TSA_PER_DAY', 5_000, 1, 10_000_000),
   };
 };
 
@@ -68,6 +74,8 @@ export const createRecordStamps = (
     maxWaitMs = 30 * 60_000,
     maxQueue = 1_000,
     maxPerHolder = 20,
+    perHolderPerDay = 200,
+    perTsaPerDay = 5_000,
     maxAttempts = 3,
     backoffMs = 30_000,
     maxBackoffMs = 10 * 60_000,
@@ -107,6 +115,11 @@ export const createRecordStamps = (
   );
   const waiting = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE tsa_url = ? AND state = 'queued'`);
   const waitingFor = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE holder = ? AND tsa_url = ? AND state = 'queued'`);
+  // What a day has used: queued or stamped in the last 24 hours (a request made or to be made).
+  const usedToday = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE tsa_url = ? AND state IN ('queued', 'stamped') AND queued_at > ?`);
+  const usedTodayBy = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE holder = ? AND tsa_url = ? AND state IN ('queued', 'stamped') AND queued_at > ?`);
+  const forgetAll = st(`DELETE FROM record_timestamps WHERE record_id = ?`);
+  const forgetOthers = st(`DELETE FROM record_timestamps WHERE record_id = ? AND commitment != ?`);
   const next = st(`SELECT commitment, record_id, queued_at, attempts FROM record_timestamps
     WHERE tsa_url = ? AND state = 'queued' ORDER BY queued_at, commitment LIMIT 1`);
   const toBatch = st(`UPDATE record_timestamps SET state = 'batch', error = ? WHERE commitment = ? AND tsa_url = ? AND state = 'queued'`);
@@ -233,12 +246,15 @@ export const createRecordStamps = (
       const t = now();
       const touched = new Set();
       db.transaction(() => {
+        const dayAgo = t - 86_400_000;
         for (const lane of lanes) {
-          let room = maxQueue - waiting.get(lane.svc.url).n;
-          let mine = holder ? maxPerHolder - waitingFor.get(holder, lane.svc.url).n : maxPerHolder;
+          let room = Math.min(maxQueue - waiting.get(lane.svc.url).n, perTsaPerDay - usedToday.get(lane.svc.url, dayAgo).n);
+          let mine = holder
+            ? Math.min(maxPerHolder - waitingFor.get(holder, lane.svc.url).n, perHolderPerDay - usedTodayBy.get(holder, lane.svc.url, dayAgo).n)
+            : maxPerHolder;
           for (const it of ok) {
             const full = room <= 0 || mine <= 0;
-            const why = room <= 0 ? 'the queue was full; its batch is timestamped instead' : 'this holder had many waiting; its batch is timestamped instead';
+            const why = room <= 0 ? 'the queue or the day was full; its batch is timestamped instead' : 'this holder had many waiting or used today; its batch is timestamped instead';
             const info = insert.run(it.commitment, lane.svc.url, it.id, holder, full ? 'batch' : 'queued', t, full ? why : null);
             if (info.changes) {
               added++;
@@ -282,11 +298,23 @@ export const createRecordStamps = (
       return { status: 'stamped', stamps: 'the proof code as 32 raw bytes', tokens, ...(queued ? { stillAsking: queued } : {}), note: RECORD_STAMP_NOTE };
     },
 
-    /** The DER token for a proof code from one TSA (the first stamped one when none is named), or null. */
+    /**
+     * The DER token for a proof code from one TSA (the first stamped one when none is named), or
+     * null. Only while a record still carries the proof code, as instantFor (TSA-4).
+     */
     tokenFor(commitment, tsaUrl) {
       if (!HEX64.test(String(commitment))) return null;
       const r = rowsOf.all(commitment).find((x) => x.state === 'stamped' && x.token && (tsaUrl === undefined || x.tsa_url === tsaUrl));
-      return r ? Buffer.from(r.token) : null;
+      return r && stillHeld(r.record_id, r.commitment) ? Buffer.from(r.token) : null;
+    },
+
+    /**
+     * A record was deleted (or, with `keep`, its proof code changed to `keep`): every timestamp
+     * row of it goes (every other proof code's). Synchronous, so the caller's transaction holds it.
+     */
+    forgetRecord(recordId, keep) {
+      if (typeof recordId !== 'string') return 0;
+      return (keep === undefined ? forgetAll.run(recordId) : forgetOthers.run(recordId, keep)).changes;
     },
 
     /** Resolves once nothing is in flight or scheduled (tests). */

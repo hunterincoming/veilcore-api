@@ -244,6 +244,8 @@ import('./lineage/routes.mjs')
       minIntervalMs: stampSettings.minIntervalMs,
       maxWaitMs: stampSettings.maxWaitMs,
       maxQueue: stampSettings.maxQueue,
+      perHolderPerDay: stampSettings.perHolderPerDay,
+      perTsaPerDay: stampSettings.perTsaPerDay,
     });
     startOtsTimer();
     startTsaTimer().catch((e) => console.error('RFC 3161 timestamps off:', e.message));
@@ -1683,6 +1685,8 @@ app.put('/api/records', (req, res) => {
   // queued only, after the save is written. Never awaited, and never a reason to fail the save.
   if (outcome === 'ok' && toStamp.length) {
     try {
+      // A record whose proof code changed: the old proof code's timestamps go (TSA-4).
+      for (const { id, commitment } of toStamp) recordStamps?.forgetRecord(id, commitment);
       recordStamps?.enqueue(toStamp, holder);
     } catch (e) {
       console.error('record timestamp queue failed:', e.message);
@@ -1886,6 +1890,9 @@ app.delete('/api/records', (req, res) => {
           // A malformed body still gets its tombstone, just without a proof code.
         }
         tombstones.mark(id, holder, fp, t);
+        // Its own timestamps go with it, in the same transaction (security review of PR #145,
+        // TSA-4): a deleted record stays deleted, and the registry keeps less, not more.
+        recordStamps?.forgetRecord(id);
         if (corrects) clearLinkTo.run(t, corrects, holder, id);
         delGrant.run(id, holder);
         delNotices.run(id, holder);
