@@ -327,6 +327,30 @@ test('a day’s budget per holder and per TSA: past it, the batch’s token inst
   db.close();
 });
 
+test('deleting records does not give a holder their day back', async () => {
+  const db = new Database(':memory:');
+  const c = clock();
+  const tsa = fakeTsa();
+  const s = createRecordStamps(db, { request: tsa.request, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer, minIntervalMs: 0, perHolderPerDay: 2, perTsaPerDay: 100 });
+  s.configure(CFG);
+  const code = (i) => i.toString(16).padStart(64, 'e');
+  for (let i = 0; i < 2; i++) {
+    s.enqueue([{ id: `VEIL-D${i}`, commitment: code(i) }], 'holder-a');
+    await c.fire();
+    assert.equal(s.forgetRecord(`VEIL-D${i}`), 1, 'deleted');
+  }
+  // Save again, delete again: the day is still used.
+  s.enqueue([{ id: 'VEIL-D9', commitment: code(9) }], 'holder-a');
+  assert.equal(s.instantFor(code(9)).status, 'batch');
+  assert.equal(tsa.asked.length, 2);
+  // The log keeps no more than a day.
+  c.advance(86_400_001);
+  s.enqueue([{ id: 'VEIL-D8', commitment: code(8) }], 'holder-a');
+  assert.equal(s.instantFor(code(8)).status, 'queued');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM record_timestamp_usage').get().n, 1, 'old rows pruned');
+  db.close();
+});
+
 test('a deleted record’s timestamps go: not served, not kept', async () => {
   const db = new Database(':memory:');
   const c = clock();

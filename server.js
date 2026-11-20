@@ -1668,6 +1668,9 @@ app.put('/api/records', (req, res) => {
       for (const id of inserted) {
         if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id), fpOf(plan.get(id).body));
       }
+      // A record whose proof code changed: the old proof code's timestamps go, in the same
+      // transaction as the save (TSA-4), so no reader sees the new record with the old stamp.
+      for (const { id, commitment } of newProofCodes) recordStamps?.forgetRecord(id, commitment);
       toStamp = newProofCodes;
     });
     for (;;) {
@@ -1685,8 +1688,6 @@ app.put('/api/records', (req, res) => {
   // queued only, after the save is written. Never awaited, and never a reason to fail the save.
   if (outcome === 'ok' && toStamp.length) {
     try {
-      // A record whose proof code changed: the old proof code's timestamps go (TSA-4).
-      for (const { id, commitment } of toStamp) recordStamps?.forgetRecord(id, commitment);
       recordStamps?.enqueue(toStamp, holder);
     } catch (e) {
       console.error('record timestamp queue failed:', e.message);

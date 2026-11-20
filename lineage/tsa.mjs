@@ -179,20 +179,24 @@ const certIds = (der) => {
   const serial = intValue(b, f[k++]);
   k++; // signature algorithm
   const issuer = Buffer.from(f[k++].whole);
-  let ski;
-  const ext = f.find((x) => x.tag === 0xa3);
-  if (ext) {
+  // Every extensions block and every subject key identifier: a certificate with more than one of
+  // either is refused (ambiguous), since two parsers can pick different ones (security re-check,
+  // 20 Nov 2026: veilcore-records keeps the last, a first-match reader the first).
+  const blocks = f.filter((x) => x.tag === 0xa3);
+  const skis = [];
+  for (const ext of blocks) {
     const [list] = children(b, ext);
     for (const e of children(b, list)) {
       const parts = children(b, e);
       if (parts[0].tag === 0x06 && b.subarray(parts[0].start, parts[0].end).equals(Buffer.from('551d0e', 'hex'))) {
         const octets = parts[parts.length - 1];
         const inner = tlv(b, octets.start);
-        ski = Buffer.from(b.subarray(inner.start, inner.end));
+        skis.push(Buffer.from(b.subarray(inner.start, inner.end)));
       }
     }
   }
-  return { serial, issuer, ski };
+  if (blocks.length > 1 || skis.length > 1) throw new Error('ambiguous certificate');
+  return { serial, issuer, ski: skis[0] };
 };
 
 /**
@@ -220,16 +224,30 @@ export const signerCertificate = (token) => {
       const ski = Buffer.from(b.subarray(sid.start, sid.end));
       match = (c) => !!c.ski && c.ski.equals(ski);
     } else return undefined;
-    return tokenCertificates(b).find((der) => {
-      try {
-        return match(certIds(der));
-      } catch {
-        return false;
-      }
-    });
+    // Exactly one certificate may match the signer (the same one carried twice counts once): a
+    // certificate this can't read, or a second, different match, makes the token ambiguous.
+    const found = [];
+    for (const der of tokenCertificates(b)) {
+      if (match(certIds(der)) && !found.some((d) => d.equals(der))) found.push(der);
+    }
+    return found.length === 1 ? found[0] : undefined;
   } catch {
     return undefined;
   }
+};
+
+/**
+ * The same token with its certificates taken out. Checked with
+ * verifyTimestampToken(stripped, data, { certificates: [pinned] }), the signature can only be
+ * checked with the pinned certificate's key: the pin binds exactly the key that signed.
+ */
+export const stripCertificates = (token) => {
+  const b = Buffer.from(token);
+  const ci = tlv(b, 0);
+  const [type, explicit] = children(b, ci);
+  const [sd] = children(b, explicit);
+  const fields = children(b, sd).filter((k) => k.tag !== 0xa0);
+  return der(0x30, Buffer.from(type.whole), der(0xa0, der(0x30, ...fields.map((k) => Buffer.from(k.whole)))));
 };
 
 /**
@@ -278,6 +296,14 @@ export const requestTimestamp = async (rootHex, cfg, { fetchImpl = fetch, now = 
     const cert = signerCertificate(token);
     const fp = cert ? createHash('sha256').update(cert).digest('hex') : '';
     if (!cfg.pins.includes(fp)) return { error: 'TSA token is not signed by the pinned certificate' };
+    // And the signature checks with that certificate's key alone (nothing else the token carries).
+    let bound;
+    try {
+      bound = await verifyTimestampToken(stripCertificates(token), root, { certificates: [cert] });
+    } catch {
+      bound = { ok: false };
+    }
+    if (!bound.ok) return { error: 'TSA token is not signed by the pinned certificate' };
   }
   return { token: Buffer.from(token).toString('base64'), genTime: v.genTime, signerSubject: v.signerSubject, serialNumber: v.serialNumber };
 };

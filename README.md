@@ -66,7 +66,7 @@ deployed.
 | `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`), sent to the first TSA in the list only. A secret: Railway only. |
 | `VEILCORE_TSA_RECORDS` | on | `off` stops the per-record tokens (batches are still stamped). |
 | `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` | `15000` | The least time between two per-record requests to the same TSA: by default the strictest free TSA's (Sectigo asks for 15 seconds). Lower it only for a TSA whose terms allow more. |
-| `VEILCORE_TSA_RECORD_PER_HOLDER_PER_DAY` | `200` | Per-record requests one holder can cause per TSA in 24 hours. Past it, the batch's token. |
+| `VEILCORE_TSA_RECORD_PER_HOLDER_PER_DAY` | `200` | Per-record requests one holder can cause per TSA in 24 hours. Past it, the batch's token. Counted in `record_timestamp_usage` (TSA, holder key, time; pruned after a day), which deleting a record doesn't touch, so delete-and-save again can't buy more. |
 | `VEILCORE_TSA_RECORD_PER_TSA_PER_DAY` | `5000` | Per-record requests to one TSA in 24 hours, from everyone. Keeps a paid TSA's bill bounded and a free one's limits for the batch roots, which are asked separately and hourly. |
 | `VEILCORE_TSA_RECORD_MAX_WAIT_MS` | 30 minutes | A proof code still waiting this long gets no token of its own from that TSA; its batch's token dates it. |
 | `VEILCORE_TSA_RECORD_MAX_QUEUE` | `1000` | Per TSA. A proof code arriving while this many wait is left to its batch's token. |

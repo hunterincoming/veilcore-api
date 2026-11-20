@@ -107,6 +107,15 @@ export const createRecordStamps = (
     );
     CREATE INDEX IF NOT EXISTS record_timestamps_queue ON record_timestamps (tsa_url, state, queued_at);
     CREATE INDEX IF NOT EXISTS record_timestamps_holder ON record_timestamps (holder, tsa_url, state);
+    -- What each day has used, kept apart from the rows above so deleting a record (or changing its
+    -- proof code) never gives a holder their day back. Only times, TSAs and holder keys; pruned after a day.
+    CREATE TABLE IF NOT EXISTS record_timestamp_usage (
+      tsa_url TEXT NOT NULL,
+      holder TEXT,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS record_timestamp_usage_tsa ON record_timestamp_usage (tsa_url, at);
+    CREATE INDEX IF NOT EXISTS record_timestamp_usage_holder ON record_timestamp_usage (holder, tsa_url, at);
   `);
   const st = (sql) => db.prepare(sql);
   const insert = st(
@@ -115,9 +124,12 @@ export const createRecordStamps = (
   );
   const waiting = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE tsa_url = ? AND state = 'queued'`);
   const waitingFor = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE holder = ? AND tsa_url = ? AND state = 'queued'`);
-  // What a day has used: queued or stamped in the last 24 hours (a request made or to be made).
-  const usedToday = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE tsa_url = ? AND state IN ('queued', 'stamped') AND queued_at > ?`);
-  const usedTodayBy = st(`SELECT COUNT(*) AS n FROM record_timestamps WHERE holder = ? AND tsa_url = ? AND state IN ('queued', 'stamped') AND queued_at > ?`);
+  // What a day has used: every request queued in the last 24 hours, from the usage log, which
+  // deleting a record does not touch (so delete-and-save again can't buy more requests).
+  const usedToday = st(`SELECT COUNT(*) AS n FROM record_timestamp_usage WHERE tsa_url = ? AND at > ?`);
+  const usedTodayBy = st(`SELECT COUNT(*) AS n FROM record_timestamp_usage WHERE holder = ? AND tsa_url = ? AND at > ?`);
+  const used = st(`INSERT INTO record_timestamp_usage (tsa_url, holder, at) VALUES (?, ?, ?)`);
+  const pruneUsage = st(`DELETE FROM record_timestamp_usage WHERE at <= ?`);
   const forgetAll = st(`DELETE FROM record_timestamps WHERE record_id = ?`);
   const forgetOthers = st(`DELETE FROM record_timestamps WHERE record_id = ? AND commitment != ?`);
   const next = st(`SELECT commitment, record_id, queued_at, attempts FROM record_timestamps
@@ -247,6 +259,7 @@ export const createRecordStamps = (
       const touched = new Set();
       db.transaction(() => {
         const dayAgo = t - 86_400_000;
+        pruneUsage.run(dayAgo);
         for (const lane of lanes) {
           let room = Math.min(maxQueue - waiting.get(lane.svc.url).n, perTsaPerDay - usedToday.get(lane.svc.url, dayAgo).n);
           let mine = holder
@@ -259,6 +272,7 @@ export const createRecordStamps = (
             if (info.changes) {
               added++;
               if (!full) {
+                used.run(lane.svc.url, holder, t);
                 room--;
                 mine--;
                 touched.add(lane);
