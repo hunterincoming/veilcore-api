@@ -61,6 +61,7 @@ deployed.
 | `VEILCORE_SEAL_EVERY_MINUTES` | `60` | With the timer on: seal at least this often while anything is pending (5 to 1440). The sponsor's `ANCHOR_EVERY_MINUTES`. |
 | `VEILCORE_SEAL_AT_PENDING` | `25` | With the timer on: seal straight away once this many records are pending (1 to 100000). The sponsor's `ANCHOR_AT_PENDING`. |
 | `VEILCORE_SEAL_CHECK_MS` | `300000` (5 min) | With the timer on: how often it looks (1000 to 3600000). |
+| `VEILCORE_SEAL_BACKLOG_EVERY_MINUTES` | `360` (6 h) | With the timer on, while the sponsor is behind (the oldest unanchored batch has waited over two periods): seal at most this often, by time only. Each batch is one Midnight fee when the sponsor catches up, so a week's outage leaves about 28 batches to anchor rather than 168 or more. |
 | `VEILCORE_OTS` | on | `off` disables automatic OpenTimestamps stamping on seal and the upkeep timer. The operator routes still work. |
 | `VEILCORE_OTS_INTERVAL_MS` | `1800000` (30 min) | How often the upkeep timer retries failed stamps and upgrades pending ones. |
 | `VEILCORE_TSA_URL` | unset | An RFC 3161 Time Stamping Authority, https (http only with a signer pin). When set, every batch root gets a timestamp token from it within the hour (see "RFC 3161 timestamps"). It is published with each token, so no query string or password. Unset: none. |
@@ -1858,7 +1859,11 @@ clock (`seal-timer.js`) and asks the Bitcoin calendars and the TSA straight away
 then only anchors sealed batches on Midnight, oldest first, which its job already does
 (`pickBatch` in `sponsor/src/anchorer.ts`). During a sponsor or Midnight outage new records
 still get two independent dates within the hour; Midnight catches up batch by batch when the
-sponsor is back (one per sponsor run, five minutes apart, each its own fee).
+sponsor is back (one per sponsor run, five minutes apart, each its own fee). While the sponsor
+is behind, the timer seals only every 6 hours (`VEILCORE_SEAL_BACKLOG_EVERY_MINUTES`), so the
+catch-up costs fewer fees; records are still dated on Bitcoin and by the TSA within that time.
+After a seal the TSA upkeep runs at once, at most once every 30 minutes (each run retries every
+batch without a token, and a batch has five quick tries before it drops to daily).
 
 There is one sealer at a time. The timer and `POST /batches/seal` share one queue in the
 process, and a record's proof is a plain insert, so a record can't end up in two batches.
@@ -1866,8 +1871,10 @@ process, and a record's proof is a plain insert, so a record can't end up in two
 25 pending), measured from the newest batch in the database. A restart or a batch the sponsor
 sealed therefore counts. With the timer on, `POST /batches/seal` seals only when the timer
 would. Otherwise it answers `400 {"error":"nothing pending","notDue":true,...}`, which every
-sponsor build already reads as "nothing sealed this run", not as a failure. The sponsor needs
-no change.
+sponsor build already reads as "nothing sealed this run", not as a failure, and so is a seal
+refused because another process on the same database is sealing (a rolling deploy). The
+sponsor needs no change; keep its `ANCHOR_EVERY_MINUTES` equal to `VEILCORE_SEAL_EVERY_MINUTES`
+so the cadence the site shows matches.
 
 Turning it on: deploy this registry first, then set `VEILCORE_SEAL_TIMER=on` on the
 `veilcore-api` service and deploy the change (a Railway Restart does not apply a new

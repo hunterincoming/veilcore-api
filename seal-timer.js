@@ -27,6 +27,9 @@
 //   VEILCORE_SEAL_EVERY_MINUTES=60    seal at least this often while anything is pending (5 to 1440)
 //   VEILCORE_SEAL_AT_PENDING=25       seal straight away once this many are pending (1 to 100000)
 //   VEILCORE_SEAL_CHECK_MS=300000     how often the timer looks (1000 to 3600000)
+//   VEILCORE_SEAL_BACKLOG_EVERY_MINUTES=360  while the sponsor is behind (the oldest unanchored
+//                                     batch waited over two periods): seal at most this often,
+//                                     by time only, so catching up costs fewer Midnight fees
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -50,9 +53,10 @@ const sealTimerSettings = (env = process.env) => {
   const everyMinutes = int(env.VEILCORE_SEAL_EVERY_MINUTES, 60, 5, 24 * 60, 'VEILCORE_SEAL_EVERY_MINUTES', problems);
   const atPending = int(env.VEILCORE_SEAL_AT_PENDING, 25, 1, 100_000, 'VEILCORE_SEAL_AT_PENDING', problems);
   const checkMs = int(env.VEILCORE_SEAL_CHECK_MS, 5 * 60_000, 1000, 3_600_000, 'VEILCORE_SEAL_CHECK_MS', problems);
+  const backlogMinutes = int(env.VEILCORE_SEAL_BACKLOG_EVERY_MINUTES, 360, 5, 24 * 60, 'VEILCORE_SEAL_BACKLOG_EVERY_MINUTES', problems);
   // A setting that can't be read keeps the timer off: sealing then stays with the sponsor, as
   // before, rather than running on a guess.
-  return { on: raw === 'on' && problems.length === 0, everyMs: everyMinutes * 60_000, atPending, checkMs, problems };
+  return { on: raw === 'on' && problems.length === 0, everyMs: everyMinutes * 60_000, atPending, checkMs, backlogEveryMs: backlogMinutes * 60_000, problems };
 };
 
 /**
@@ -60,21 +64,36 @@ const sealTimerSettings = (env = process.env) => {
  * batch's sealing time). `afterSeal(batchId)` runs after each seal this makes (the TSA upkeep);
  * it is never awaited and its failure never undoes a seal.
  */
-const createSealTimer = ({ batches, db, everyMs = 60 * 60_000, atPending = 25, now = Date.now, afterSeal = () => {}, log = () => {} }) => {
+const createSealTimer = ({ batches, db, everyMs = 60 * 60_000, atPending = 25, backlogEveryMs = 6 * 60 * 60_000, anchoring = true, now = Date.now, afterSeal = () => {}, log = () => {} }) => {
   const newest = db.prepare('SELECT MAX(sealed_at) AS t FROM batches');
+  const oldestWaiting = db.prepare('SELECT MIN(sealed_at) AS t FROM batches WHERE anchor IS NULL');
+  /**
+   * Is the sponsor behind? Each batch is one Midnight fee when the sponsor catches up, so
+   * while the oldest unanchored batch has waited over two periods, batches are sealed at most
+   * every backlogEveryMs (default 6 hours) and not by count: a week's outage is about 28
+   * batches to anchor, not 168 or more. Bitcoin and the TSA still date every record within
+   * that time. Only when this registry anchors at all (`anchoring`).
+   */
+  const behind = () => {
+    if (!anchoring) return false;
+    const t = oldestWaiting.get()?.t;
+    return typeof t === 'number' && now() - t > 2 * everyMs;
+  };
   let chain = Promise.resolve();
-  const status = { lastRunAt: null, lastSealedBatch: null, lastError: null };
+  const status = { lastRunAt: null, lastSealedBatch: null, lastError: null, backlog: false };
 
   /** When the next seal is due by time alone, for a newest batch sealed at `last`. */
-  const dueAt = (last) => (last ? last + everyMs : 0);
+  const dueAt = (last, slow) => (last ? last + (slow ? Math.max(everyMs, backlogEveryMs) : everyMs) : 0);
 
   const once = async () => {
     status.lastRunAt = new Date(now()).toISOString();
     const pending = batches.pending().length;
     if (pending === 0) return { sealed: false, pending: 0 };
     const last = newest.get()?.t ?? null;
-    const due = pending >= atPending || now() >= dueAt(last);
-    if (!due) return { sealed: false, pending, notDue: true, nextSealAt: new Date(dueAt(last)).toISOString() };
+    const slow = behind();
+    status.backlog = slow;
+    const due = (!slow && pending >= atPending) || now() >= dueAt(last, slow);
+    if (!due) return { sealed: false, pending, notDue: true, nextSealAt: new Date(dueAt(last, slow)).toISOString() };
     const out = await batches.seal();
     if (out.error) {
       // 'nothing pending' here means the records went away while sealing: not a problem.

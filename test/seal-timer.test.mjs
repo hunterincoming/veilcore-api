@@ -43,7 +43,7 @@ const memory = (n = 0) => {
 // ---- settings --------------------------------------------------------------------------
 
 test('settings: off unless VEILCORE_SEAL_TIMER=on; the sponsor’s numbers by default; a bad setting keeps it off', () => {
-  assert.deepEqual(sealTimerSettings({}), { on: false, everyMs: 3_600_000, atPending: 25, checkMs: 300_000, problems: [] });
+  assert.deepEqual(sealTimerSettings({}), { on: false, everyMs: 3_600_000, atPending: 25, checkMs: 300_000, backlogEveryMs: 21_600_000, problems: [] });
   assert.equal(sealTimerSettings({ VEILCORE_SEAL_TIMER: 'on' }).on, true);
   assert.equal(sealTimerSettings({ VEILCORE_SEAL_TIMER: 'off' }).on, false);
   const odd = sealTimerSettings({ VEILCORE_SEAL_TIMER: 'yes' });
@@ -53,7 +53,8 @@ test('settings: off unless VEILCORE_SEAL_TIMER=on; the sponsor’s numbers by de
   assert.equal(bad.on, false, 'a minute is under the five-minute floor: off, said why');
   assert.match(bad.problems[0], /VEILCORE_SEAL_EVERY_MINUTES/);
   const set = sealTimerSettings({ VEILCORE_SEAL_TIMER: 'on', VEILCORE_SEAL_EVERY_MINUTES: '30', VEILCORE_SEAL_AT_PENDING: '5', VEILCORE_SEAL_CHECK_MS: '60000' });
-  assert.deepEqual(set, { on: true, everyMs: 1_800_000, atPending: 5, checkMs: 60_000, problems: [] });
+  assert.deepEqual(set, { on: true, everyMs: 1_800_000, atPending: 5, checkMs: 60_000, backlogEveryMs: 21_600_000, problems: [] });
+  assert.equal(sealTimerSettings({ VEILCORE_SEAL_TIMER: 'on', VEILCORE_SEAL_BACKLOG_EVERY_MINUTES: '120' }).backlogEveryMs, 7_200_000);
 });
 
 // ---- when it seals ---------------------------------------------------------------------
@@ -117,6 +118,37 @@ test('exactly once: the timer and the sponsor’s seal call at the same moment m
   assert.ok(outs.every((o) => o.sealed || (o.pending === 0 && !o.error)), 'the rest found nothing pending, none was refused');
   assert.equal(m.db.prepare('SELECT COUNT(*) AS n FROM batch_proofs').get().n, 40);
   assert.equal(m.db.prepare('SELECT COUNT(DISTINCT batch_id) AS n FROM batch_proofs').get().n, 1);
+});
+
+test('sponsor behind: while the oldest unanchored batch has waited two periods, seal every 6 hours by time only (fewer Midnight fees to catch up)', async () => {
+  const m = memory();
+  let t = 1_800_000_000_000;
+  const timer = createSealTimer({ batches: m.batches, db: m.db, everyMs: 3_600_000, atPending: 2, backlogEveryMs: 6 * 3_600_000, now: () => t });
+  m.add(1);
+  assert.equal((await timer.sealIfDue()).sealed, true);
+  const first = m.db.prepare('SELECT MAX(sealed_at) AS t FROM batches').get().t;
+  // Three hours on, nothing anchored: behind. Many pending and an hour gone: still waits.
+  t = first + 3 * 3_600_000;
+  m.add(10);
+  const held = await timer.sealIfDue();
+  assert.equal(held.sealed, false);
+  assert.equal(held.notDue, true);
+  assert.equal(held.nextSealAt, new Date(first + 6 * 3_600_000).toISOString());
+  assert.equal(timer.status().backlog, true);
+  t = first + 6 * 3_600_000;
+  assert.equal((await timer.sealIfDue()).sealed, true, 'six hours: dated on Bitcoin and by the TSA all the same');
+  // The sponsor catches up: every batch anchored, back to the normal rule at once.
+  m.db.prepare("UPDATE batches SET anchor = '{}'").run();
+  m.add(2);
+  assert.equal((await timer.sealIfDue()).sealed, true, 'two pending is the count again');
+  assert.equal(timer.status().backlog, false);
+  // A registry that anchors nowhere is never "behind".
+  const n = memory(1);
+  const none = createSealTimer({ batches: n.batches, db: n.db, everyMs: 3_600_000, atPending: 1, anchoring: false, now: () => t });
+  assert.equal((await none.sealIfDue()).sealed, true);
+  n.add(1);
+  const tl = createSealTimer({ batches: n.batches, db: n.db, everyMs: 3_600_000, atPending: 1, anchoring: false, now: () => t + 10 * 3_600_000 });
+  assert.equal((await tl.sealIfDue()).sealed, true);
 });
 
 test('one failed seal does not stop the next; afterSeal failing never undoes a seal', async () => {

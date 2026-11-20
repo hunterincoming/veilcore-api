@@ -3338,10 +3338,25 @@ let tsaKick = null; // set by startTsaTimer: run the RFC 3161 upkeep now
 const SEAL_TIMER = (() => {
   const s = sealTimerSettings(process.env);
   if (s.problems.length) console.error(`seal timer off: ${s.problems.join('; ')}`);
-  else if (s.on) console.log(`seal timer on (every ${s.everyMs / 60_000} min while anything is pending, or at ${s.atPending} pending; looks every ${Math.round(s.checkMs / 1000)} s)`);
+  else if (s.on) console.log(`seal timer on (every ${s.everyMs / 60_000} min while anything is pending, or at ${s.atPending} pending; every ${s.backlogEveryMs / 60_000} min while the sponsor is behind; looks every ${Math.round(s.checkMs / 1000)} s)`);
   return s;
 })();
 let sealTimer = null;
+// The TSA run after a seal, at most once every 30 minutes. Each run retries every batch without
+// a token, and a batch gets five quick tries before dropping to daily: kicked on every seal
+// during a TSA outage, those would be gone in under half an hour (review, 20 Nov 2026).
+let lastTsaKick = 0;
+const kickTsaSoon = () => {
+  if (!tsaKick || Date.now() - lastTsaKick < 30 * 60_000) return;
+  lastTsaKick = Date.now();
+  tsaKick();
+};
+// An explorer setting that isn't https is left out (lineage/ots.mjs explorersFrom): say so.
+{
+  const named = String(process.env.VEILCORE_BTC_EXPLORER ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  const bad = named.filter((x) => { try { return new URL(x).protocol !== 'https:'; } catch { return true; } });
+  if (bad.length) console.error(`VEILCORE_BTC_EXPLORER: ${bad.length} address(es) not https were left out${bad.length === named.length ? '; using blockstream.info and mempool.space instead' : ''}`);
+}
 const sealTimerNow = () => {
   if (!SEAL_TIMER.on || !batches) return null;
   sealTimer ??= createSealTimer({
@@ -3349,7 +3364,9 @@ const sealTimerNow = () => {
     db,
     everyMs: SEAL_TIMER.everyMs,
     atPending: SEAL_TIMER.atPending,
-    afterSeal: () => tsaKick?.(),
+    backlogEveryMs: SEAL_TIMER.backlogEveryMs,
+    anchoring: ANCHOR_CONFIG.configured,
+    afterSeal: () => kickTsaSoon(),
     log: (level, msg) => (level === 'info' ? console.log(msg) : console.error(msg)),
   });
   return sealTimer;
@@ -3372,7 +3389,9 @@ app.post('/batches/seal', async (req, res) => {
   if (timer) {
     const { sealed, code, notDue, nextSealAt, pending, ...out } = await timer.sealIfDue();
     if (sealed) return res.json(out);
-    if (out.error && out.error !== 'nothing pending') return res.status(code ?? 400).json(out);
+    // A 409 here is another process's seal on the same database (a rolling deploy): for the
+    // sponsor that is "nothing this run", not a failure (review, 20 Nov 2026).
+    if (out.error && out.error !== 'nothing pending' && code !== 409) return res.status(code ?? 400).json(out);
     return res.status(400).json({
       ...out,
       error: 'nothing pending',
@@ -4093,8 +4112,9 @@ app.get('/.well-known/veilcore-registry', (_req, res) => {
  *   lab-files-failing   some lab-result files could not be copied off-site
  *   database-large      past 1 GB: plan the volume (backup.mjs LARGE_BYTES)
  *   timestamps-behind   a TSA is set and a batch sealed over three hours ago has no token
- *   ots-behind          a batch sealed over a day ago (in the last week) is still not in a
- *                       Bitcoin block: calendars or explorers failing, or a stamp never sent
+ *   ots-behind          a batch sealed over a day ago (in the last week) was sent for a Bitcoin
+ *                       stamp and is still not in a block: calendars or explorers failing.
+ *                       Batches sealed while VEILCORE_OTS=off were never sent and don't count
  *   disk-low            the volume has less than a fifth free, or less than twice the
  *                       database (a backup needs room for two temporary copies)
  */
