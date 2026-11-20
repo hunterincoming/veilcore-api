@@ -52,42 +52,72 @@ export const timeStampRequest = (stamped, nonce = randomBytes(8)) => {
 /**
  * The TSA settings from the environment, or null when no TSA is set (attack on this branch,
  * 5 Nov 2026: the token must be tied to the TSA, or anyone on the path could answer).
- *   VEILCORE_TSA_URL              https; http only together with a signer pin
- *   VEILCORE_TSA_SIGNER_SHA256    the SHA-256 of the TSA's signing certificate(s), comma
- *                                 separated: a token signed by any other certificate is refused
- *   VEILCORE_TSA_QUALIFIED_SCHEME the operator's statement that the service is qualified, and
+ *   VEILCORE_TSA_URL              one TSA, or several separated by commas or spaces (reliability
+ *                                 audit, 19 Nov 2026: one service, run by one person, was a single
+ *                                 point of failure). A token is asked from each, separately, so
+ *                                 one that is slow or down never holds up the others. https; http
+ *                                 only with a signer pin for that service
+ *   VEILCORE_TSA_SIGNER_SHA256    the SHA-256 of a TSA's signing certificate(s), comma separated:
+ *                                 a token signed by any other certificate is refused. A plain
+ *                                 fingerprint pins every service with no pin of its own; one
+ *                                 written `host=fingerprint` pins only the service at that host
+ *                                 (timestamp.digicert.com=ab12…). An http service needs one
+ *   VEILCORE_TSA_QUALIFIED_SCHEME the operator's statement that the FIRST service is qualified, and
  *                                 under what: "eIDAS" (an EU trusted list) or "JP-MIC" (Japan's
- *                                 accredited time-stamping). Unset: not stated qualified.
+ *                                 accredited time-stamping). Unset: not stated qualified
  *   VEILCORE_TSA_TRUSTED_LIST     where a reader checks that (a URL)
- *   VEILCORE_TSA_AUTHORIZATION    the Authorization header a paid TSA needs; https only
+ *   VEILCORE_TSA_AUTHORIZATION    the Authorization header a paid TSA needs, sent to the FIRST
+ *                                 service only; https only
+ * Returns { services: [{ url, pins, qualified, authorization }], ...the first service's fields }
+ * (the first service's fields at the top, as a single-TSA setting always read), or { error }.
  */
 export const tsaConfig = (env = process.env) => {
-  const url = (env.VEILCORE_TSA_URL ?? '').trim();
-  if (!url) return null;
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return { error: 'VEILCORE_TSA_URL is not a URL' };
+  const urls = String(env.VEILCORE_TSA_URL ?? '').split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+  if (urls.length === 0) return null;
+  if (urls.length > 5) return { error: 'VEILCORE_TSA_URL lists more than five TSAs' };
+  const scoped = new Map(); // host -> pins
+  const plain = [];
+  for (const raw of String(env.VEILCORE_TSA_SIGNER_SHA256 ?? '').split(',').map((x) => x.trim()).filter(Boolean)) {
+    const eq = raw.indexOf('=');
+    const host = eq > 0 ? raw.slice(0, eq).trim().toLowerCase() : null;
+    const fp = (eq > 0 ? raw.slice(eq + 1) : raw).trim().toLowerCase().replace(/:/g, '');
+    if (!/^[0-9a-f]{64}$/.test(fp)) return { error: 'VEILCORE_TSA_SIGNER_SHA256 must be SHA-256 fingerprints' };
+    if (host !== null && !/^[a-z0-9.-]+(:\d+)?$/.test(host)) return { error: 'VEILCORE_TSA_SIGNER_SHA256: write a scoped pin as host=fingerprint' };
+    if (host) scoped.set(host, [...(scoped.get(host) ?? []), fp]);
+    else plain.push(fp);
   }
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') return { error: 'VEILCORE_TSA_URL must be https' };
-  if (u.username || u.password || u.search) return { error: 'VEILCORE_TSA_URL must carry no password or query (it is published); use VEILCORE_TSA_AUTHORIZATION' };
-  const pins = (env.VEILCORE_TSA_SIGNER_SHA256 ?? '').split(',').map((x) => x.trim().toLowerCase().replace(/:/g, '')).filter(Boolean);
-  if (pins.some((p) => !/^[0-9a-f]{64}$/.test(p))) return { error: 'VEILCORE_TSA_SIGNER_SHA256 must be SHA-256 fingerprints' };
   const authorization = (env.VEILCORE_TSA_AUTHORIZATION ?? '').trim() || undefined;
-  if (u.protocol === 'http:' && pins.length === 0) return { error: 'an http TSA needs VEILCORE_TSA_SIGNER_SHA256' };
-  if (u.protocol === 'http:' && authorization) return { error: 'VEILCORE_TSA_AUTHORIZATION needs an https TSA' };
   const scheme = (env.VEILCORE_TSA_QUALIFIED_SCHEME ?? '').trim();
   if (scheme && scheme !== 'eIDAS' && scheme !== 'JP-MIC') return { error: 'VEILCORE_TSA_QUALIFIED_SCHEME is eIDAS or JP-MIC' };
   const trustedList = (env.VEILCORE_TSA_TRUSTED_LIST ?? '').trim();
-  return {
-    url: u.href,
-    pins,
-    // Only what the operator states (SDK SPEC 9.2 `qualified: { scheme, trustedList }`); a
-    // reader checks the list themselves.
-    qualified: scheme ? { scheme, ...(trustedList ? { trustedList } : {}) } : null,
-    authorization,
-  };
+  const services = [];
+  for (const [i, url] of urls.entries()) {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return { error: `VEILCORE_TSA_URL is not a URL (${i + 1} in the list)` };
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return { error: 'VEILCORE_TSA_URL must be https' };
+    if (u.username || u.password || u.search) return { error: 'VEILCORE_TSA_URL must carry no password or query (it is published); use VEILCORE_TSA_AUTHORIZATION' };
+    if (services.some((s) => s.url === u.href)) return { error: `VEILCORE_TSA_URL lists ${u.host} twice` };
+    const pins = scoped.get(u.host.toLowerCase()) ?? scoped.get(u.hostname.toLowerCase()) ?? plain;
+    const auth = i === 0 ? authorization : undefined;
+    if (u.protocol === 'http:' && pins.length === 0) return { error: `an http TSA needs VEILCORE_TSA_SIGNER_SHA256 (${u.host})` };
+    if (u.protocol === 'http:' && auth) return { error: 'VEILCORE_TSA_AUTHORIZATION needs an https TSA' };
+    services.push({
+      url: u.href,
+      pins,
+      // Only what the operator states (SDK SPEC 9.2 `qualified: { scheme, trustedList }`), for
+      // the first service; a reader checks the list themselves.
+      qualified: i === 0 && scheme ? { scheme, ...(trustedList ? { trustedList } : {}) } : null,
+      authorization: auth,
+    });
+  }
+  for (const host of scoped.keys())
+    if (!services.some((s) => new URL(s.url).host.toLowerCase() === host || new URL(s.url).hostname.toLowerCase() === host))
+      return { error: `VEILCORE_TSA_SIGNER_SHA256 pins ${host}, which VEILCORE_TSA_URL doesn't list` };
+  return { ...services[0], services };
 };
 
 /** The certificates a CMS SignedData token carries (its [0] IMPLICIT certificates), DER. */

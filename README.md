@@ -59,11 +59,15 @@ deployed.
 | `VEILCORE_ANCHOR_CONTRACT` | unset | Address of the anchoring (main VeilCore) contract, 64 hex; `0x` and capitals accepted, published in lower case. |
 | `VEILCORE_OTS` | on | `off` disables automatic OpenTimestamps stamping on seal and the upkeep timer. The operator routes still work. |
 | `VEILCORE_OTS_INTERVAL_MS` | `1800000` (30 min) | How often the upkeep timer retries failed stamps and upgrades pending ones. |
-| `VEILCORE_TSA_URL` | unset | An RFC 3161 Time Stamping Authority, https (http only with a signer pin). When set, every batch root gets a timestamp token from it within the hour (see "RFC 3161 timestamps"). It is published with each token, so no query string or password. Unset: none. |
-| `VEILCORE_TSA_SIGNER_SHA256` | unset | SHA-256 fingerprint(s) of the TSA's signing certificate, comma separated. A token signed by any other certificate is refused. Update it when the TSA renews its certificate (the alert `timestamps-behind` says when tokens stop). |
-| `VEILCORE_TSA_QUALIFIED_SCHEME` | unset | `eIDAS` (a qualified service on an EU trusted list) or `JP-MIC` (Japan's accredited time-stamping), only when the operator has checked that list. Published as `qualified: { scheme, trustedList }`; readers check the list themselves. |
+| `VEILCORE_TSA_URL` | unset | One RFC 3161 Time Stamping Authority, or up to five separated by commas or spaces, https (http only with a signer pin for that service). When set, every batch root gets a timestamp token from each within the hour, and each new proof code one from each within seconds (see "RFC 3161 timestamps"). Each is asked separately: one that is slow or down never holds up the others. Published with each token, so no query string or password. Unset: none. |
+| `VEILCORE_TSA_SIGNER_SHA256` | unset | SHA-256 fingerprint(s) of a TSA's signing certificate, comma separated. A token signed by any other certificate is refused. A plain fingerprint pins every service that has no pin of its own; `host=fingerprint` pins only the service at that host. Update it when a TSA renews its certificate (the alert `timestamps-behind` says when the first TSA's tokens stop). |
+| `VEILCORE_TSA_QUALIFIED_SCHEME` | unset | `eIDAS` (a qualified service on an EU trusted list) or `JP-MIC` (Japan's accredited time-stamping), for the first TSA in the list only, and only when the operator has checked that list. Published as `qualified: { scheme, trustedList }`; readers check the list themselves. |
 | `VEILCORE_TSA_TRUSTED_LIST` | unset | Where a reader checks that status (a URL). |
-| `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`). A secret: Railway only. |
+| `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`), sent to the first TSA in the list only. A secret: Railway only. |
+| `VEILCORE_TSA_RECORDS` | on | `off` stops the per-record tokens (batches are still stamped). |
+| `VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` | `2000` | The least time between two per-record requests to the same TSA. Some free TSAs ask for 15 seconds (`15000`). |
+| `VEILCORE_TSA_RECORD_MAX_WAIT_MS` | 30 minutes | A proof code still waiting this long gets no token of its own from that TSA; its batch's token dates it. |
+| `VEILCORE_TSA_RECORD_MAX_QUEUE` | `1000` | Per TSA. A proof code arriving while this many wait is left to its batch's token. |
 | `VEILCORE_BTC_EXPLORER` | `https://blockstream.info/api` | Esplora API used to fetch Bitcoin block headers when checking an upgraded proof. |
 | `LAB_RESULTS_DIR` | `lab-results` next to `DB_PATH` | Folder for the locked lab-result files (one file per result). On Railway: `/data/lab-results`, on the same volume. Ignored when `DB_PATH` is `:memory:` (files are then kept in memory). See "Lab results". |
 | `LAB_RESULTS_MAX_BYTES` | `2147483648` (2 GiB) | Most all lab-result files together may take. Past it, uploads get 507 "storage full". |
@@ -1864,6 +1868,40 @@ stated, plus `genTime` and a `note`) on every inclusion proof, in evidence (`bat
 ```
 openssl ts -verify -data root.bin -in root.tst -token_in -CAfile <the TSA's certificate chain>
 ```
+
+Several TSAs (reliability audit, 19 Nov 2026: one free service, run by one person, was a
+single point of failure). `VEILCORE_TSA_URL` takes a list; each TSA is asked on its own, at
+the same time, and its token is kept beside the others. The first TSA's token is where it
+always was (`rfc3161`, `root.tst`); the others are further `rfc3161` anchors on the proof,
+`batch.rfc3161Others` in evidence and exports, and `root.tst?tsa=<its address>`. What the
+operator would set for three free services (check each one's terms for this volume first;
+DigiCert is plain http, so it needs its own pin, read from a token it issued):
+
+```
+VEILCORE_TSA_URL=https://freetsa.org/tsr https://timestamp.sectigo.com http://timestamp.digicert.com
+VEILCORE_TSA_SIGNER_SHA256=timestamp.digicert.com=<SHA-256 of DigiCert's TSA signing certificate>
+VEILCORE_TSA_RECORD_MIN_INTERVAL_MS=15000
+```
+
+### A token for each record, in seconds
+
+The moment the registry takes a proof code new to a record (PUT `/api/records/dating`, or PUT
+`/api/records` with a new proof code), it queues that proof code for a token of its own from
+each TSA (`lineage/record-stamps.mjs`): the 32 raw bytes of the proof code, checked exactly as
+a batch root's token is. Taking the proof code never waits for a TSA: the queue is a database
+row, and the requests run after, one at a time per TSA, at least
+`VEILCORE_TSA_RECORD_MIN_INTERVAL_MS` apart, pausing longer after each failure (up to ten
+minutes). After three failed tries, `VEILCORE_TSA_RECORD_MAX_WAIT_MS` of waiting, or a full
+queue, that TSA gives that proof code none, and its batch's token dates it as before. A proof
+code whose record was deleted before its turn is dropped. Public:
+
+- `GET /proof/:commitment/instant`: 200 `{ status: "stamped", tokens: [{ kind: "rfc3161", token, tsa, genTime, qualified?, signer? }], stillAsking?, note }`, 202 `{ status: "queued" }`, or 404 `{ status: "batch" | "none" }`.
+- `GET /proof/:commitment/instant.tst?tsa=<address>`: one token as DER, for
+  `openssl ts -verify -data <proof code as 32 raw bytes> -in instant.tst -token_in -CAfile <chain>`.
+
+The token shows the proof code existed by the time the TSA states, nothing earlier; the record's
+Midnight date still comes with its batch. The TSA sees a SHA-256 of the proof code and when it
+was asked. `/health` lists `record-timestamp-v1`.
 
 Why: a court weighs a blockchain date case by case; a timestamp from a qualified trust
 service carries a legal presumption in the EU (eIDAS Article 41(2)), and Japan has its own
