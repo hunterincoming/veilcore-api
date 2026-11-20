@@ -787,6 +787,9 @@ const featuresServed = () => [
   // The account copy (lineage/account-copy.mjs): one locked copy of a person's keys, opened by
   // several ways in, saved by itself. A site that saves it needs a registry with these routes.
   ...(accountCopies ? ['account-copy-v1'] : []),
+  // Each slot listed with the fingerprint of its sealed account key (`wrap`): the site checks it
+  // against the one sealed in the copy, so a changed or damaged way in is seen on the next check.
+  ...(accountCopies ? ['account-slot-check-v1'] : []),
   // A lab's key on its own website (lineage/lab-domain.mjs): did:web documents read too, and a
   // key the website stopped listing served as `domainWithdrawn`. A site reads both if present.
   'lab-domain-withdrawn-v1',
