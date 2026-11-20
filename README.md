@@ -1703,7 +1703,8 @@ migration. The site saves the copy by itself, at most every 30 to 60 quiet secon
 - `PUT /account-copy/:id` `{ token, prev, iv, ct, slot? }`: save over the copy this device last
   saw (`prev`, its fingerprint, or `'none'`); 409 if another device saved since. The first save
   must bring its first way in (`slot: { slotId, kind, tokenHash, iv, ct }`).
-- `POST /account-copy/:id/read` `{ token }`: the copy and its slots' ids and kinds.
+- `POST /account-copy/:id/read` `{ token }`: the copy and its slots' ids, kinds and `wrap`
+  (the SHA-256 fingerprint of each slot's sealed account key, as `copyFingerprint`).
 - `POST /account-copy/:id/head` `{ token }`: the copy's fingerprint, date and slots, without it.
 - `POST /account-copy/:id/delete` `{ token }`: the copy and every slot.
 - `PUT /account-copy/:id/slots/:slotId` `{ token, kind, tokenHash, iv, ct }`: add a way in.
@@ -1719,7 +1720,11 @@ site's `docs/passkey-backup.md` has the re-key procedure for after one. Tokens t
 Limits: 20 new copies per client (an IPv6 client by its /48) a UTC day; 500 saves and slot
 changes per copy a UTC day (counted per copy, not per address, so people behind one shared
 mobile address don't use up each other's); 20 slots a copy; about 2 MB of ciphertext.
-/health lists `account-copy-v1`.
+/health lists `account-copy-v1`, and `account-slot-check-v1` for the `wrap` fingerprints: the
+site keeps each one inside the sealed copy when it opens that way in, and compares it on every
+check, so a slot changed or damaged here is noticed then, not first at a restore. Kinds made
+today: `passkey`, and `recovery` (a printed recovery sheet's code, made on the device: its slot
+id, read token and sealing key come from the code through HKDF, so the registry never sees it).
 
 What the registry can see: which slots open which copy, the copy's size bucket, and when it is
 saved or checked. A save soon after a holder's record write from the same address lets it

@@ -152,6 +152,27 @@ test('ways in are added and removed with the copy’s token, never the last one'
   assert.equal((await call('POST', `/account-slot/${s.body.slotId}/read`, { token: s.token })).status, 200);
 });
 
+test('each way in is listed with its wrap fingerprint, so a changed one is seen on the next check', async () => {
+  const h = await call('GET', '/health');
+  assert.ok(h.json.features.includes('account-slot-check-v1'));
+  const c = newCopy();
+  await make(c);
+  const s = newSlot('recovery');
+  await call('PUT', `/account-copy/${c.id}/slots/${s.body.slotId}`, { token: c.token, ...s.body });
+  const want = (x) => ({ slotId: x.body.slotId, kind: x.body.kind, wrap: copyFingerprint(x.body.iv, x.body.ct) });
+  for (const route of ['read', 'head']) {
+    const got = (await call('POST', `/account-copy/${c.id}/${route}`, { token: c.token })).json.slots;
+    assert.deepEqual(
+      got.map(({ slotId, kind, wrap }) => ({ slotId, kind, wrap })),
+      [want(c.slot), want(s)],
+    );
+  }
+  // A recovery sheet's slot is read with its own token, as a passkey's is.
+  const read = await call('POST', `/account-slot/${s.body.slotId}/read`, { token: s.token });
+  assert.equal(read.status, 200);
+  assert.deepEqual([read.json.copyId, read.json.kind, read.json.iv, read.json.ct], [c.id, 'recovery', s.body.iv, s.body.ct]);
+});
+
 test('nothing in a URL: a token in a query string is not a token', async () => {
   const c = newCopy();
   await make(c);
