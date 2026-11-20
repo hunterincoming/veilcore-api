@@ -177,6 +177,7 @@ db.exec(`
 // interleave. After the holder key conversion above, so the index sees each holder under one
 // key. A database already holding two corrections of one record keeps both (one is marked and
 // left out of the index) and the log says which, at every start.
+const { sealTimerSettings, createSealTimer } = require('./seal-timer.js');
 const { ensureOneCorrection, isSecondCorrection, alreadyCorrectedRefusal, supersededByLockedRefusal, recordRefusedRefusal, CORRECTED } = require('./corrections.js');
 ensureOneCorrection(db);
 
@@ -369,6 +370,9 @@ async function startTsaTimer() {
   };
   setTimeout(run, 60_000).unref();
   setInterval(run, 3_600_000).unref();
+  // Right after a seal (the seal timer below), rather than within the hour. If a run is already
+  // going, wait for it to finish first, so a new batch is never skipped.
+  tsaKick = () => (async () => { for (let i = 0; i < 40 && running; i++) await new Promise((r) => setTimeout(r, 15_000)); await run(); })();
 }
 
 const app = express();
@@ -3324,10 +3328,57 @@ app.get('/batches/pending', (req, res) => {
   res.json({ count: rows.length, records: rows.map((r) => r.id), ...(skipped.length ? { skipped } : {}) });
 });
 
-/** Seal everything pending into a batch. */
+/**
+ * The registry's own seal timer (seal-timer.js; reliability audit, 19 Nov 2026). Off
+ * unless VEILCORE_SEAL_TIMER=on. On, pending records are sealed into a batch on the registry's
+ * own clock and stamped on Bitcoin and by the TSA at once, whether or not the sponsor is
+ * running; the sponsor only anchors the sealed batches on Midnight.
+ */
+let tsaKick = null; // set by startTsaTimer: run the RFC 3161 upkeep now
+const SEAL_TIMER = (() => {
+  const s = sealTimerSettings(process.env);
+  if (s.problems.length) console.error(`seal timer off: ${s.problems.join('; ')}`);
+  else if (s.on) console.log(`seal timer on (every ${s.everyMs / 60_000} min while anything is pending, or at ${s.atPending} pending; looks every ${Math.round(s.checkMs / 1000)} s)`);
+  return s;
+})();
+let sealTimer = null;
+const sealTimerNow = () => {
+  if (!SEAL_TIMER.on || !batches) return null;
+  sealTimer ??= createSealTimer({
+    batches,
+    db,
+    everyMs: SEAL_TIMER.everyMs,
+    atPending: SEAL_TIMER.atPending,
+    afterSeal: () => tsaKick?.(),
+    log: (level, msg) => (level === 'info' ? console.log(msg) : console.error(msg)),
+  });
+  return sealTimer;
+};
+if (SEAL_TIMER.on) {
+  const tick = () => void sealTimerNow()?.sealIfDue();
+  setTimeout(tick, Math.min(60_000, SEAL_TIMER.checkMs)).unref();
+  setInterval(tick, SEAL_TIMER.checkMs).unref();
+}
+
+/**
+ * Seal everything pending into a batch. With the seal timer on, only when the timer would
+ * (seal-timer.js): otherwise 400 `nothing pending` with `notDue: true`, which the sponsor
+ * reads as "nothing sealed this run", so the two never seal twice as often between them.
+ */
 app.post('/batches/seal', async (req, res) => {
   if (!requireOperator(req, res)) return;
   if (!requireBatches(res)) return;
+  const timer = sealTimerNow();
+  if (timer) {
+    const { sealed, code, notDue, nextSealAt, pending, ...out } = await timer.sealIfDue();
+    if (sealed) return res.json(out);
+    if (out.error && out.error !== 'nothing pending') return res.status(code ?? 400).json(out);
+    return res.status(400).json({
+      ...out,
+      error: 'nothing pending',
+      ...(notDue ? { notDue: true, pending, nextSealAt, sealedBy: 'registry' } : {}),
+    });
+  }
   const { code, ...out } = await batches.seal();
   res.status(out.error ? (code ?? 400) : 200).json(out);
 });
@@ -4042,6 +4093,8 @@ app.get('/.well-known/veilcore-registry', (_req, res) => {
  *   lab-files-failing   some lab-result files could not be copied off-site
  *   database-large      past 1 GB: plan the volume (backup.mjs LARGE_BYTES)
  *   timestamps-behind   a TSA is set and a batch sealed over three hours ago has no token
+ *   ots-behind          a batch sealed over a day ago (in the last week) is still not in a
+ *                       Bitcoin block: calendars or explorers failing, or a stamp never sent
  *   disk-low            the volume has less than a fifth free, or less than twice the
  *                       database (a backup needs room for two temporary copies)
  */
@@ -4058,6 +4111,7 @@ app.get('/alerts', (_req, res) => {
     if (b.large) problems.push('database-large');
   }
   if (tsaOn && batches?.tsaBehind()) problems.push('timestamps-behind');
+  if (process.env.VEILCORE_OTS !== 'off' && batches?.otsBehind()) problems.push('ots-behind');
   if (DB_PATH !== ':memory:') {
     try {
       const fsys = require('node:fs').statfsSync(require('node:path').dirname(DB_PATH));

@@ -47,6 +47,22 @@ export const DEFAULT_CALENDARS = [
 ];
 /** Where Bitcoin block headers are fetched to check an upgraded proof (Esplora API). */
 export const DEFAULT_EXPLORER = 'https://blockstream.info/api';
+/**
+ * The explorers the registry asks by default (reliability audit, 19 Nov 2026): two run by
+ * different people, so one wrong or compromised explorer cannot make a Bitcoin stamp look
+ * real on its own. Both serve the Esplora API.
+ */
+export const DEFAULT_EXPLORERS = [DEFAULT_EXPLORER, 'https://mempool.space/api'];
+
+/**
+ * The explorers named by VEILCORE_BTC_EXPLORER: one address, or several separated by commas.
+ * Unset or empty: DEFAULT_EXPLORERS. An address that is not https is left out (fetchCapped
+ * would refuse it anyway); if none is left, the defaults are used rather than none.
+ */
+export const explorersFrom = (setting) => {
+  const list = String(setting ?? '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter((s) => s && isHttpsUrl(s));
+  return list.length ? [...new Set(list)] : [...DEFAULT_EXPLORERS];
+};
 
 // "\x00OpenTimestamps\x00\x00Proof\x00" followed by 8 magic bytes, then major version 1.
 const HEADER = Buffer.concat([
@@ -443,7 +459,38 @@ export const checkBitcoinBlock = async (height, merkleRoot, { explorer = DEFAULT
     e.mismatch = true;
     throw e;
   }
-  return { height, time: new Date(header.readUInt32LE(68) * 1000).toISOString() };
+  return { height, time: new Date(header.readUInt32LE(68) * 1000).toISOString(), hash };
+};
+
+/**
+ * The same check with every explorer in `explorers`, which must all agree (reliability audit,
+ * 19 Nov 2026). Each is asked at the same time. The block is believed only when every one of
+ * them fetched a header that hashes to the hash it gave, holds the attested Merkle root, and
+ * names the same block hash as the others:
+ *   - any explorer whose header does not hold the root makes it a mismatch (`mismatch: true`),
+ *     even if another explorer was down: one down never hides another's mismatch;
+ *   - an explorer that can't be reached, or explorers naming different blocks, is an error
+ *     without `mismatch`, so the answer stays pending and the upkeep timer asks again later.
+ *     A stamp waiting too long raises the `ots-behind` alert, which says to look.
+ * Returns { height, time, hash, explorers } (the hosts asked). Throws OtsError.
+ */
+export const checkBitcoinBlockAgreed = async (height, merkleRoot, { explorers = DEFAULT_EXPLORERS, fetchImpl = fetch, timeoutMs = 15_000, checkOne = checkBitcoinBlock } = {}) => {
+  if (!Array.isArray(explorers) || explorers.length === 0) throw new OtsError('no Bitcoin explorer is set');
+  const hostOf = (e) => { try { return new URL(e).host; } catch { return 'an explorer'; } };
+  const settled = await Promise.allSettled(explorers.map((explorer) => checkOne(height, merkleRoot, { explorer, fetchImpl, timeoutMs })));
+  const lied = settled.findIndex((s) => s.status === 'rejected' && s.reason?.mismatch);
+  if (lied >= 0) {
+    const e = new OtsError(`Bitcoin attestation does not match block ${height} (header from ${hostOf(explorers[lied])})`);
+    e.mismatch = true;
+    throw e;
+  }
+  const down = settled.findIndex((s) => s.status === 'rejected');
+  if (down >= 0) throw new OtsError(`block ${height}: ${hostOf(explorers[down])} gave no usable header (${summarise(settled[down].reason)}); not believed until every explorer agrees`);
+  const got = settled.map((s) => s.value);
+  if (got.some((g) => g.hash !== undefined && g.hash !== got[0].hash) || got.some((g) => g.time !== got[0].time)) {
+    throw new OtsError(`explorers disagree about block ${height}; not believed`);
+  }
+  return { ...got[0], explorers: explorers.map(hostOf) };
 };
 
 /**
@@ -452,7 +499,10 @@ export const checkBitcoinBlock = async (height, merkleRoot, { explorer = DEFAULT
  * block it names, and merge it in. Only pending URIs that belong to one of `calendars`
  * are contacted. Returns { answer, bitcoin: {height, time} | null, pending, errors }.
  */
-export const upgradeAnswer = async (answer, digest, { calendars = DEFAULT_CALENDARS, fetchImpl = fetch, timeoutMs = 15_000, explorer = DEFAULT_EXPLORER, checkBlock = checkBitcoinBlock } = {}) => {
+export const upgradeAnswer = async (answer, digest, { calendars = DEFAULT_CALENDARS, fetchImpl = fetch, timeoutMs = 15_000, explorer, explorers, checkBlock = checkBitcoinBlock } = {}) => {
+  // Several explorers, all of which must agree (checkBitcoinBlockAgreed). `explorer` (one
+  // address) is still accepted, as before: then only that one is asked.
+  const asked = Array.isArray(explorers) && explorers.length ? explorers : explorer ? [explorer] : DEFAULT_EXPLORERS;
   const ts = parseTimestamp(answer, digest, storedPolicy);
   const errors = [];
   let pending = 0;
@@ -472,7 +522,7 @@ export const upgradeAnswer = async (answer, digest, { calendars = DEFAULT_CALEND
       const blocks = attestationsOf(up).filter((a) => a.kind === 'bitcoin');
       if (blocks.length === 0) { pending++; continue; }
       const checked = [];
-      for (const b of blocks) checked.push(await checkBlock(b.height, b.msg, { explorer, fetchImpl, timeoutMs }));
+      for (const b of blocks) checked.push(await checkBitcoinBlockAgreed(b.height, b.msg, { explorers: asked, fetchImpl, timeoutMs, checkOne: checkBlock }));
       mergeInto(leaf.node, up);
       for (const c of checked) if (!best || c.height < best.height) best = c;
     } catch (e) {

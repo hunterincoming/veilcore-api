@@ -57,6 +57,10 @@ deployed.
 | `VEILCORE_ANCHOR_CHAIN` | `midnight` | Chain batch roots are anchored on. |
 | `VEILCORE_ANCHOR_NETWORK` | unset | Network of the anchoring contract: `preview`, `preprod` or `mainnet`. Set together with the next one, or no anchor is recorded. |
 | `VEILCORE_ANCHOR_CONTRACT` | unset | Address of the anchoring (main VeilCore) contract, 64 hex; `0x` and capitals accepted, published in lower case. |
+| `VEILCORE_SEAL_TIMER` | off | `on`: the registry seals pending records into a batch on its own clock and asks for the Bitcoin stamp and the RFC 3161 token at once, with or without the sponsor (see "The seal timer"). Off: batches are sealed only when the sponsor's anchoring job (or an operator) calls `POST /batches/seal`, as before. |
+| `VEILCORE_SEAL_EVERY_MINUTES` | `60` | With the timer on: seal at least this often while anything is pending (5 to 1440). The sponsor's `ANCHOR_EVERY_MINUTES`. |
+| `VEILCORE_SEAL_AT_PENDING` | `25` | With the timer on: seal straight away once this many records are pending (1 to 100000). The sponsor's `ANCHOR_AT_PENDING`. |
+| `VEILCORE_SEAL_CHECK_MS` | `300000` (5 min) | With the timer on: how often it looks (1000 to 3600000). |
 | `VEILCORE_OTS` | on | `off` disables automatic OpenTimestamps stamping on seal and the upkeep timer. The operator routes still work. |
 | `VEILCORE_OTS_INTERVAL_MS` | `1800000` (30 min) | How often the upkeep timer retries failed stamps and upgrades pending ones. |
 | `VEILCORE_TSA_URL` | unset | An RFC 3161 Time Stamping Authority, https (http only with a signer pin). When set, every batch root gets a timestamp token from it within the hour (see "RFC 3161 timestamps"). It is published with each token, so no query string or password. Unset: none. |
@@ -64,7 +68,7 @@ deployed.
 | `VEILCORE_TSA_QUALIFIED_SCHEME` | unset | `eIDAS` (a qualified service on an EU trusted list) or `JP-MIC` (Japan's accredited time-stamping), only when the operator has checked that list. Published as `qualified: { scheme, trustedList }`; readers check the list themselves. |
 | `VEILCORE_TSA_TRUSTED_LIST` | unset | Where a reader checks that status (a URL). |
 | `VEILCORE_TSA_AUTHORIZATION` | unset | The `Authorization` header a paid TSA needs (for example `Basic …`). A secret: Railway only. |
-| `VEILCORE_BTC_EXPLORER` | `https://blockstream.info/api` | Esplora API used to fetch Bitcoin block headers when checking an upgraded proof. |
+| `VEILCORE_BTC_EXPLORER` | `https://blockstream.info/api,https://mempool.space/api` | Esplora APIs used to fetch Bitcoin block headers when checking an upgraded proof, separated by commas. Every one must give the same header holding the attested root before a stamp is marked `bitcoin`: one lying is a mismatch, one down leaves the stamp pending until the next try. One address: only that one is asked, as before. |
 | `LAB_RESULTS_DIR` | `lab-results` next to `DB_PATH` | Folder for the locked lab-result files (one file per result). On Railway: `/data/lab-results`, on the same volume. Ignored when `DB_PATH` is `:memory:` (files are then kept in memory). See "Lab results". |
 | `LAB_RESULTS_MAX_BYTES` | `2147483648` (2 GiB) | Most all lab-result files together may take. Past it, uploads get 507 "storage full". |
 | `LAB_RESULTS_MAX_BYTES_PER_SENDER` | `314572800` (300 MB) | Most the lab-result files on the deliveries one holder sent may take together (507). See "Lab results". |
@@ -123,7 +127,8 @@ Lab-result files go too, each once, under `lab-results/<id>`.
 **One address for a monitor: `GET /alerts`.** It answers 200 `{"ok":true,"problems":[]}`,
 or 503 with `ok: false` and short codes: `backup-off`, `backup-misconfigured`, `backup-overdue`,
 `backup-failing`, `lab-files-failing`, `timestamps-behind` (a TSA is set and a batch sealed
-in the last week, over three hours ago, has no token), `database-large` (past 1 GB) and `disk-low` (under a
+in the last week, over three hours ago, has no token), `ots-behind` (a batch sealed in the last
+week, over a day ago, is still not in a Bitcoin block), `database-large` (past 1 GB) and `disk-low` (under a
 fifth free, or under twice the database, the room a backup needs). Nothing else: no sizes,
 names or counts. In UptimeRobot: a plain HTTP(s) monitor on `https://<registry>/alerts`;
 it alarms on anything but 200. The same contract as the sponsor's `/sponsor/alerts`.
@@ -1843,6 +1848,33 @@ it is never written. Pinned in `test/billing-off.test.mjs`. Tests: `test/billing
   contract came from; `test/vendored-contract.test.mjs` fails if those files change
   without it.
 
+## The seal timer (`VEILCORE_SEAL_TIMER`, 19 Nov 2026)
+
+Before it, a batch was sealed only when the sponsor's anchoring job asked, and the sponsor
+asks only while its wallet is synced. So a Midnight, Blockfrost, proof-server or wallet problem
+stopped all three dates for new records, Bitcoin and the RFC 3161 token included, because
+both stamp a sealed batch root. With `VEILCORE_SEAL_TIMER=on` the registry seals on its own
+clock (`seal-timer.js`) and asks the Bitcoin calendars and the TSA straight away. The sponsor
+then only anchors sealed batches on Midnight, oldest first, which its job already does
+(`pickBatch` in `sponsor/src/anchorer.ts`). During a sponsor or Midnight outage new records
+still get two independent dates within the hour; Midnight catches up batch by batch when the
+sponsor is back (one per sponsor run, five minutes apart, each its own fee).
+
+There is one sealer at a time. The timer and `POST /batches/seal` share one queue in the
+process, and a record's proof is a plain insert, so a record can't end up in two batches.
+"Due" uses the sponsor's own rule (every 60 minutes while anything is pending, or at once at
+25 pending), measured from the newest batch in the database. A restart or a batch the sponsor
+sealed therefore counts. With the timer on, `POST /batches/seal` seals only when the timer
+would. Otherwise it answers `400 {"error":"nothing pending","notDue":true,...}`, which every
+sponsor build already reads as "nothing sealed this run", not as a failure. The sponsor needs
+no change.
+
+Turning it on: deploy this registry first, then set `VEILCORE_SEAL_TIMER=on` on the
+`veilcore-api` service and deploy the change (a Railway Restart does not apply a new
+variable). The deploy log says `seal timer on (...)`. To turn it off, remove the variable and deploy again:
+sealing goes back to the sponsor alone. A value it can't read (anything but `on` or `off`, or a
+number out of range) keeps the timer off and the log says why.
+
 ## RFC 3161 timestamps
 
 With `VEILCORE_TSA_URL` set, every batch root also gets a timestamp token from that Time
@@ -1880,9 +1912,12 @@ merged from those answers.
 
 A stamp is `pending` (the calendar's promise to put the root in a Bitcoin transaction)
 until it is upgraded. The upkeep timer, or `POST /batches/:id/opentimestamps/upgrade`,
-asks the calendars for the path to the block, checks the block header against
-`VEILCORE_BTC_EXPLORER`, and only then marks it `bitcoin` with the block height and time.
-Proofs (`/proof/:commitment`), `/batches` and `/api/export` report the status.
+asks the calendars for the path to the block, checks the block header against every
+explorer in `VEILCORE_BTC_EXPLORER` (blockstream.info and mempool.space by default, which must
+agree), and only then marks it `bitcoin` with the block height and time.
+Proofs (`/proof/:commitment`), `/batches` and `/api/export` report the status. A stamp still
+not in a block a day after sealing raises `ots-behind` on `/alerts` (a calendar's transaction
+normally confirms within hours).
 
 Operator routes (`x-operator-token`):
 
