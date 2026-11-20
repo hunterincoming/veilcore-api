@@ -185,6 +185,8 @@ ensureOneCorrection(db);
 let lineage = null;
 let transfers = null;
 let batches = null;
+// One RFC 3161 token per proof code, in seconds (lineage/record-stamps.mjs), set once loaded.
+let recordStamps = null;
 let attesters = null;
 let proveRequests = null; // lineage/prove-requests.mjs, set once loaded
 let licenseInvites = null; // lineage/license-invites.mjs, set once loaded
@@ -231,6 +233,20 @@ import('./lineage/routes.mjs')
     transfers = createTransfers(db, lineage, { maxRecords: MAX_PER_HOLDER, maxBytes: HOLDER_MAX_BYTES });
     const { createBatches } = await import('./lineage/batches.mjs');
     batches = createBatches(db);
+    // Before the TSA timer below, which turns it on when a TSA is set.
+    const { createRecordStamps, recordStampSettings } = await import('./lineage/record-stamps.mjs');
+    const { requestTimestamp } = await import('./lineage/tsa.mjs');
+    const stampSettings = recordStampSettings(process.env);
+    const fpOfRecord = db.prepare(`SELECT 1 FROM records WHERE id = ? AND json_extract(body, '$.recordFingerprint') = ?`);
+    recordStamps = createRecordStamps(db, {
+      request: requestTimestamp,
+      stillHeld: (id, fp) => !!fpOfRecord.get(id, fp),
+      minIntervalMs: stampSettings.minIntervalMs,
+      maxWaitMs: stampSettings.maxWaitMs,
+      maxQueue: stampSettings.maxQueue,
+      perHolderPerDay: stampSettings.perHolderPerDay,
+      perTsaPerDay: stampSettings.perTsaPerDay,
+    });
     startOtsTimer();
     startTsaTimer().catch((e) => console.error('RFC 3161 timestamps off:', e.message));
     const { createAttesters } = await import('./lineage/attesters.mjs');
@@ -357,8 +373,16 @@ async function startTsaTimer() {
   const cfg = tsaConfig(process.env);
   if (!cfg) return;
   if (cfg.error) { console.error(`RFC 3161 timestamps off: ${cfg.error}`); return; }
-  console.log(`RFC 3161 timestamps on (${new URL(cfg.url).host}${cfg.pins.length ? ', signer pinned' : ''}${cfg.qualified ? `, stated qualified under ${cfg.qualified.scheme}` : ''})`);
+  for (const svc of cfg.services ?? [cfg])
+    console.log(`RFC 3161 timestamps on (${new URL(svc.url).host}${svc.pins.length ? ', signer pinned' : ''}${svc.qualified ? `, stated qualified under ${svc.qualified.scheme}` : ''})`);
   tsaOn = true;
+  // Each new proof code too, in seconds (lineage/record-stamps.mjs), unless VEILCORE_TSA_RECORDS=off.
+  const { recordStampSettings } = await import('./lineage/record-stamps.mjs');
+  const s = recordStampSettings(process.env);
+  if (recordStamps && s.on) {
+    recordStamps.configure(cfg);
+    console.log(`RFC 3161 timestamps per record on (at least ${s.minIntervalMs} ms apart; the batch's token after ${Math.round(s.maxWaitMs / 60_000)} min)`);
+  }
   let running = false;
   const run = async () => {
     if (running || !batches) return;
@@ -793,6 +817,11 @@ const featuresServed = () => [
   // A lab's key on its own website (lineage/lab-domain.mjs): did:web documents read too, and a
   // key the website stopped listing served as `domainWithdrawn`. A site reads both if present.
   'lab-domain-withdrawn-v1',
+  // A timestamp of its own for each new proof code (lineage/record-stamps.mjs): GET
+  // /proof/:commitment/instant answers the RFC 3161 token, "queued", or "batch" (its batch's
+  // token dates it instead). Listed whether or not a TSA is set: without one every answer is
+  // 404 and the site shows nothing. A site that reads it needs a registry with the route.
+  ...(recordStamps ? ['record-timestamp-v1'] : []),
 ];
 app.get('/health', (_req, res) => {
   // licenseChecks: what checking a signed license notice or answer needs (license notices, below).
@@ -1339,6 +1368,7 @@ app.put('/api/records', (req, res) => {
   const heldNow = db.prepare('SELECT COUNT(*) AS n FROM records WHERE holder_key = ?');
   const heldBytes = db.prepare('SELECT COALESCE(SUM(octet_length(body)), 0) AS n FROM records WHERE holder_key = ?');
   let written = 0;
+  let toStamp = []; // { id, commitment } written with a proof code new to the record (lineage/record-stamps.mjs)
   let projectedBytes = 0;
   const capRefused = new Set(); // new ids refused for a ceiling: not stored, so nothing may name them
   const freeCorrections = new Set(); // ids that are a record's one correction: not counted on a plan
@@ -1604,6 +1634,7 @@ app.put('/api/records', (req, res) => {
       const fresh = new Map();
       const inserted = []; // ids this save added for this holder
       const writtenFps = []; // proof codes this save dated anew (countingFps that were written)
+      const newProofCodes = []; // { id, commitment }: a proof code this record didn't have before, for its own timestamp
       for (const r of [...rows.filter((x) => targetOf(x) !== undefined), ...rows.filter((x) => targetOf(x) === undefined)]) {
         if (decided.has(r.item.id)) continue;
         try {
@@ -1618,6 +1649,7 @@ app.put('/api/records', (req, res) => {
             }
             const fp = fpOf(r.body);
             if (fp !== undefined && countingFps.has(fp)) writtenFps.push(fp);
+            if (typeof fp === 'string' && fp !== (typeof r.prior?.body === 'string' ? fpOf(r.prior.body) : undefined)) newProofCodes.push({ id: r.item.id, commitment: fp });
           }
         } catch (e) {
           if (!isSecondCorrection(e)) throw e;
@@ -1639,6 +1671,10 @@ app.put('/api/records', (req, res) => {
       for (const id of inserted) {
         if (freeTargets.has(id)) billing.noteFreeCorrection(holder, freeTargets.get(id), fpOf(plan.get(id).body));
       }
+      // A record whose proof code changed: the old proof code's timestamps go, in the same
+      // transaction as the save (TSA-4), so no reader sees the new record with the old stamp.
+      for (const { id, commitment } of newProofCodes) recordStamps?.forgetRecord(id, commitment);
+      toStamp = newProofCodes;
     });
     for (;;) {
       try {
@@ -1651,6 +1687,15 @@ app.put('/api/records', (req, res) => {
     return 'ok';
   });
   const outcome = tx(shaped);
+  // Each proof code new to its record gets a timestamp of its own (lineage/record-stamps.mjs):
+  // queued only, after the save is written. Never awaited, and never a reason to fail the save.
+  if (outcome === 'ok' && toStamp.length) {
+    try {
+      recordStamps?.enqueue(toStamp, holder);
+    } catch (e) {
+      console.error('record timestamp queue failed:', e.message);
+    }
+  }
   if (outcome === 'bytes') {
     return res.status(413).json({
       error: `a holder may keep at most ${megabytes(HOLDER_MAX_BYTES)} of records here; this save would make it ${megabytes(projectedBytes)}. Nothing was changed.`,
@@ -1712,6 +1757,7 @@ app.put('/api/records/dating', (req, res) => {
   const rejected = [];
   const notWritten = [];
   const dated = [];
+  const newProofCodes = []; // dated here for the first time: each gets a timestamp of its own
   const otherHolder = db.prepare(
     // Also any key that held it before (fingerprint_holders): a fingerprint released by a
     // deletion or an edit is not free for someone else to take.
@@ -1766,10 +1812,19 @@ app.put('/api/records/dating', (req, res) => {
         if (counts) room.room--;
         billing.noteAdded(holder, [item.recordFingerprint]);
         dated.push(item.id);
+        newProofCodes.push({ id: item.id, commitment: item.recordFingerprint });
       }
     }
   });
   tx(req.body);
+  // Queued only (lineage/record-stamps.mjs): never awaited, never a reason to fail the request.
+  if (newProofCodes.length) {
+    try {
+      recordStamps?.enqueue(newProofCodes, holder);
+    } catch (e) {
+      console.error('record timestamp queue failed:', e.message);
+    }
+  }
   res.json({
     ok: rejected.length === 0 && notWritten.length === 0,
     dated,
@@ -1839,6 +1894,9 @@ app.delete('/api/records', (req, res) => {
           // A malformed body still gets its tombstone, just without a proof code.
         }
         tombstones.mark(id, holder, fp, t);
+        // Its own timestamps go with it, in the same transaction (security review of PR #145,
+        // TSA-4): a deleted record stays deleted, and the registry keeps less, not more.
+        recordStamps?.forgetRecord(id);
         if (corrects) clearLinkTo.run(t, corrects, holder, id);
         delGrant.run(id, holder);
         delNotices.run(id, holder);
@@ -3421,6 +3479,38 @@ app.get('/proof/:commitment', (req, res) => {
 });
 
 /**
+ * A record's own RFC 3161 timestamp (lineage/record-stamps.mjs), asked for the moment the
+ * registry took its proof code. Public, like /proof: the token stamps the proof code's 32 raw
+ * bytes, and anyone checks it with `openssl ts -verify` or the SDK's verifyTimestampToken.
+ *   200 { status: 'stamped', stamps, tokens: [{ kind: 'rfc3161', token, tsa, genTime, qualified?, signer? }],
+ *         stillAsking?, note }   one token per TSA that has answered (VEILCORE_TSA_URL may list several)
+ *   202 { status: 'queued' }      asked for, none back yet
+ *   404 { status: 'none' }        none of its own (its batch's token dates it), no TSA set, a proof
+ *                                 code this registry never took, or one no record carries now: the
+ *                                 same answer for each, so it says nothing about which
+ */
+app.get('/proof/:commitment/instant', (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.commitment)) return res.status(400).json({ error: 'a proof code is 64 lowercase hex characters' });
+  if (!recordStamps) return res.status(503).json({ error: 'starting' });
+  const out = recordStamps.instantFor(req.params.commitment);
+  if (!out) return res.status(404).json({ status: 'none' });
+  if (out.status === 'queued') return res.status(202).json(out);
+  if (out.status === 'batch') return res.status(404).json({ status: 'none' });
+  res.json(out);
+});
+
+/**
+ * A token as DER, for `openssl ts -verify -data <proof code as 32 raw bytes> -in instant.tst -token_in`.
+ * ?tsa=<url> picks one TSA's token; without it, the first there is.
+ */
+app.get('/proof/:commitment/instant.tst', (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.commitment)) return res.status(400).json({ error: 'a proof code is 64 lowercase hex characters' });
+  const token = recordStamps?.tokenFor(req.params.commitment, typeof req.query.tsa === 'string' ? req.query.tsa : undefined);
+  if (!token) return res.status(404).json({ error: 'no timestamp of its own for this proof code' });
+  res.type('application/octet-stream').set('Content-Disposition', 'attachment; filename="instant.tst"').send(token);
+});
+
+/**
  * Stamp a batch with OpenTimestamps (for a batch sealed before stamping, or a failed
  * stamp). A batch that already has a proof is refused (409) unless ?force=1, and then the
  * fresh calendar answers are merged in beside the old ones, never in place of them.
@@ -3476,7 +3566,10 @@ app.get('/batches/:id/root.bin.ots', (req, res) => {
  */
 app.get('/batches/:id/root.tst', (req, res) => {
   if (!requireBatches(res)) return;
-  const b = batches.tsaFor(req.params.id);
+  // ?tsa=<url>: the token from that TSA, when VEILCORE_TSA_URL lists several (the proof's
+  // rfc3161 anchors name each one's address). Without it, the first TSA's.
+  const which = typeof req.query.tsa === 'string' ? req.query.tsa : undefined;
+  const b = batches.tsaFor(req.params.id, which);
   if (b === undefined) return res.status(404).json({ error: 'no such batch' });
   if (!b.token) return res.status(404).json({ error: 'this batch has no RFC 3161 timestamp yet' });
   res.type('application/octet-stream').set('Content-Disposition', 'attachment; filename="root.tst"').send(b.token);

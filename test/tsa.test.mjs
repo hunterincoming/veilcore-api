@@ -43,6 +43,35 @@ const forgeAs = (tok, pinnedDer) => {
   const nsd = sd.map((x, i) => (i === ci ? enc(0xa0, pb, forgedCert) : i === sd.length - 1 ? enc(0x31, nsi) : Buffer.from(x.w)));
   return enc(0x30, Buffer.from(ct.w), enc(0xa0, enc(0x30, ...nsd)));
 };
+// The security re-check's attack (20 Nov 2026): the forger's own certificate given a second
+// extensions block naming the pinned certificate's key identifier, and the signer named by that
+// identifier. veilcore-records keeps the last identifier, so checks the forger's signature with
+// the forger's key; a reader that keeps the first finds the pinned certificate instead.
+const skiOf = (der) => {
+  const tbs = kidsOf(der, kidsOf(der, tlv(der, 0))[0]);
+  const [list] = kidsOf(der, tbs.find((x) => x.tag === 0xa3));
+  for (const e of kidsOf(der, list)) {
+    const parts = kidsOf(der, e);
+    if (Buffer.from(parts[0].w).equals(Buffer.from('0603551d0e', 'hex'))) {
+      const inner = tlv(der, parts[parts.length - 1].s);
+      return Buffer.from(der.subarray(inner.s, inner.e));
+    }
+  }
+  throw new Error('no subject key identifier');
+};
+const twoBlockForgery = (tok, pinnedDer) => {
+  const pinned = Buffer.from(pinnedDer);
+  const pinnedSki = skiOf(pinned);
+  const b = Buffer.from(tok); const [ct, ex] = kidsOf(b, tlv(b, 0)); const sd = kidsOf(b, kidsOf(b, ex)[0]);
+  const ci = sd.findIndex((k) => k.tag === 0xa0);
+  const cc = kidsOf(b, kidsOf(b, sd[ci]).find((c) => !Buffer.from(c.w).equals(pinned)));
+  const second = enc(0xa3, enc(0x30, enc(0x30, Buffer.from('0603551d0e', 'hex'), enc(0x04, enc(0x04, pinnedSki)))));
+  const certA = enc(0x30, enc(0x30, ...kidsOf(b, cc[0]).map((x) => Buffer.from(x.w)), second), Buffer.from(cc[1].w), Buffer.from(cc[2].w));
+  const [si] = kidsOf(b, sd[sd.length - 1]);
+  const nsi = enc(0x30, ...kidsOf(b, si).map((x, i) => (i === 0 ? enc(0x02, Buffer.from([3])) : i === 1 ? enc(0x80, pinnedSki) : Buffer.from(x.w))));
+  const nsd = sd.map((x, i) => (i === ci ? enc(0xa0, certA, pinned) : i === sd.length - 1 ? enc(0x31, nsi) : Buffer.from(x.w)));
+  return enc(0x30, Buffer.from(ct.w), enc(0xa0, enc(0x30, ...nsd)));
+};
 let tsa; // { url, server, mode }
 const ssl = (...args) => execFileSync('openssl', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -68,7 +97,8 @@ before(async () => {
       else ssl('ts', '-reply', '-config', 'tsa.cnf', '-queryfile', 'q.tsq', '-out', 'r.tsr');
       res.setHeader('content-type', 'application/timestamp-reply');
       const reply = readFileSync(join(dir, 'r.tsr'));
-      res.end(tsa.forge ? forgeAs(timestampTokenBytes(reply), new X509Certificate(readFileSync(join(dir, 'tsa.pem'))).raw) : reply);
+      const pinnedDer = new X509Certificate(readFileSync(join(dir, 'tsa.pem'))).raw;
+      res.end(tsa.forge === 'two-blocks' ? twoBlockForgery(timestampTokenBytes(reply), pinnedDer) : tsa.forge ? forgeAs(timestampTokenBytes(reply), pinnedDer) : reply);
     });
   });
   await new Promise((r) => tsa.server.listen(0, '127.0.0.1', r));
@@ -125,6 +155,10 @@ test('a pinned TSA: only a token signed by that certificate is kept; the time mu
   // The same, with its certificate claiming the pinned one's issuer and a zero-padded serial.
   tsa.forge = true;
   assert.ok((await requestTimestamp(ROOT, { url: tsa.url })).token, 'the forged token still verifies unpinned');
+  assert.equal((await requestTimestamp(ROOT, { url: tsa.url, pins: [fingerprint()] })).error, 'TSA token is not signed by the pinned certificate');
+  // And with a second extensions block naming the pinned certificate's key identifier.
+  tsa.forge = 'two-blocks';
+  assert.ok((await requestTimestamp(ROOT, { url: tsa.url })).token, 'the two-block forgery verifies unpinned: the attack is real');
   assert.equal((await requestTimestamp(ROOT, { url: tsa.url, pins: [fingerprint()] })).error, 'TSA token is not signed by the pinned certificate');
   tsa.forge = false;
   tsa.mode = 'ok';
