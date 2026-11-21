@@ -18,6 +18,19 @@ The record format, its specification (`SPEC.md`) and the SDK are in
 [hunterincoming/veilcore-sdk](https://github.com/hunterincoming/veilcore-sdk). "The site"
 below means the website and app in hunterincoming/veilcore (`bboard-ui`).
 
+Related repositories:
+
+- [veilcore](https://github.com/hunterincoming/veilcore): the site and app, the fee sponsor,
+  the contracts and the deploy scripts.
+- [veilcore-sdk](https://github.com/hunterincoming/veilcore-sdk): the record format, its
+  conformance vectors and the TypeScript library (npm: `veilcore-records`).
+- [veilcore-rs](https://github.com/hunterincoming/veilcore-rs): a Rust implementation that
+  passes the same vectors.
+- [veilcore-archive](https://github.com/hunterincoming/veilcore-archive): the public mirror of
+  every dated batch, made by `scripts/mirror` (see [docs/run-a-witness.md](docs/run-a-witness.md)).
+
+Apache-2.0 ([LICENSE](LICENSE)). Security reports: [SECURITY.md](SECURITY.md).
+
 ```
 npm install
 npm test        # sets VEILCORE_OTS=off; no calendar is contacted
