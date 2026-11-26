@@ -77,7 +77,7 @@ deployed.
 | `VEILCORE_SEAL_BACKLOG_EVERY_MINUTES` | `360` (6 h) | With the timer on, while the sponsor is behind (the oldest unanchored batch has waited over two periods): seal at most this often, by time only. Each batch is one Midnight fee when the sponsor catches up, so a week's outage leaves about 28 batches to anchor rather than 168 or more. |
 | `VEILCORE_OTS` | on | `off` disables automatic OpenTimestamps stamping on seal and the upkeep timer. The operator routes still work. |
 | `VEILCORE_OTS_INTERVAL_MS` | `1800000` (30 min) | How often the upkeep timer retries failed stamps and upgrades pending ones. |
-| `VEILCORE_RESTAMP` | off | The evidence re-stamp (see "The evidence re-stamp"). `manual`: the operator's `POST /restamps` makes one. `on`: that, plus one automatically every `VEILCORE_RESTAMP_EVERY_DAYS`. Off (unset): nothing is made, no table is created, and every `/restamps` route answers 404. Needs OpenTimestamps on. |
+| `VEILCORE_RESTAMP` | off | The evidence re-stamp (see "The evidence re-stamp"). `manual`: the operator's `POST /restamps` makes one. `on`: that, plus one automatically every `VEILCORE_RESTAMP_EVERY_DAYS`. Off (unset): nothing is made, no table is created, and every `/restamps` route answers 404 (`POST /restamps` asks for the operator token first: 401 without it). Needs OpenTimestamps on. Turn it off only once the newest re-stamp shows `bitcoin`: while off, a pending one is never upgraded. |
 | `VEILCORE_RESTAMP_EVERY_DAYS` | `365` | With `VEILCORE_RESTAMP=on`: make one when the newest is this many days old, or there is none (1 to 366). |
 | `VEILCORE_TSA_URL` | unset | One RFC 3161 Time Stamping Authority, or up to five separated by commas or spaces, https (http only with a signer pin for that service). When set, every batch root gets a timestamp token from each within the hour, and each new proof code one from each within seconds (see "RFC 3161 timestamps"). Each is asked separately: one that is slow or down never holds up the others. Published with each token, so no query string or password. Unset: none. |
 | `VEILCORE_TSA_SIGNER_SHA256` | unset | SHA-256 fingerprint(s) of a TSA's signing certificate, comma separated. A token signed by any other certificate is refused. A plain fingerprint pins every service that has no pin of its own; `host=fingerprint` pins only the service at that host. With several TSAs, an http one needs its own `host=` pin: a shared pin would let someone on its path hand back another listed TSA's genuine token as this one's. Update it when a TSA renews its certificate (the alert `timestamps-behind` says when the first TSA's tokens stop). |
@@ -325,7 +325,12 @@ The rules, what is published and how to check one item offline are in the site r
 is `lineage/restamp.mjs`.
 
 Off by default. To turn it on, after the code is deployed: set `VEILCORE_RESTAMP=manual` (or
-`on`) and redeploy, then `POST /restamps` with `x-operator-token`.
+`on`) and redeploy, then `POST /restamps` with `x-operator-token`. Turn it off only once the
+newest re-stamp shows `bitcoin` (while off, nothing upgrades a pending one).
+
+Privacy: only hashes are published, but the counts per kind show how many private lab signatures
+and receipts the registry holds, and two re-stamps show how many were added between them. Keep
+manual runs rare (a trigger, not a habit).
 
 | Route | Who | What |
 |---|---|---|
@@ -335,7 +340,7 @@ Off by default. To turn it on, after the code is deployed: set `VEILCORE_RESTAMP
 | `GET /restamps/:id/root.bin`, `root.bin.ots` | anyone | The root's 32 bytes and its OpenTimestamps proof |
 | `GET /restamps/:id/proof/:entry` | anyone | The SPEC 5 inclusion proof of one entry |
 
-Check one item offline: `node scripts/restamp-check.mjs --kind <kind> --item <file> --proof <proof.json> --manifest <manifest.json>`.
+Check one item offline: `node scripts/restamp-check.mjs --kind <kind> --item <file> --proof <proof.json> --manifest <manifest.json> --root-bin root.bin`.
 
 ## Mainnet day
 

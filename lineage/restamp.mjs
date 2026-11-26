@@ -29,9 +29,13 @@
 // fingerprint, so a re-stamp root can't be passed off as a batch of records.
 //
 // What is published: the root, its .ots, and the sorted list of entries with how many of each
-// kind. Hashes only. Each entry hashes an item carrying a 64-byte signature (or a batch root,
-// already public), so nobody learns an item from its entry. The list does not say which entry
-// is which kind: only the counts.
+// kind. Hashes only. An attestation, a withdrawal or a token carries a signature nobody can
+// guess, so its entry gives nothing away. Batch roots and enrolments are public already (an
+// enrolment carries no signature here: the registry keeps none, and its entry dates the
+// registry's record of the registration). The list does not say which entry is which kind,
+// only how many of each. Anyone can compute the entries of the public items and subtract, so
+// the counts do show how many private items (lab report signatures, receipts, proof-code
+// tokens) existed, and two re-stamps show how many were added between them: docs/restamp.md.
 //
 // What this never does: publish an item, sign anything, touch a wallet, or change a batch.
 //

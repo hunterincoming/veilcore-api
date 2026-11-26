@@ -254,8 +254,16 @@ test('scripts/restamp-check.mjs: one item checked from files alone, and an edite
     writeFileSync(join(dir, 'attestation.json'), JSON.stringify(att.item, null, 2));
     writeFileSync(join(dir, 'proof.json'), JSON.stringify((await r.proofFor(restampId, att.entry)).proof));
     writeFileSync(join(dir, 'manifest.json'), JSON.stringify(r.manifest(restampId)));
-    const run = (item) => execFileSync(process.execPath, [script, '--kind', 'attestation', '--item', item, '--proof', join(dir, 'proof.json'), '--manifest', join(dir, 'manifest.json')], { stdio: 'pipe' }).toString();
-    assert.match(run(join(dir, 'attestation.json')), new RegExp(`IN THE RE-STAMP: attestation entry ${att.entry}`));
+    const run = (item, ...more) => execFileSync(process.execPath, [script, '--kind', 'attestation', '--item', item, '--proof', join(dir, 'proof.json'), '--manifest', join(dir, 'manifest.json'), ...more], { stdio: 'pipe' }).toString();
+    const plain = run(join(dir, 'attestation.json'));
+    assert.match(plain, new RegExp(`IN THE RE-STAMP: attestation entry ${att.entry}`));
+    assert.match(plain, /root\.bin not checked/);
+    // --root-bin: the file root.bin.ots stamps must be this root, or nothing is said about a date.
+    writeFileSync(join(dir, 'root.bin'), Buffer.from(fixture.root, 'hex'));
+    assert.match(run(join(dir, 'attestation.json'), '--root-bin', join(dir, 'root.bin')), /root\.bin is this root/);
+    writeFileSync(join(dir, 'other.bin'), Buffer.alloc(32, 7));
+    assert.throws(() => run(join(dir, 'attestation.json'), '--root-bin', join(dir, 'other.bin')),
+      (e) => e.status === 1 && /root\.bin is not the root the proof leads to/.test(String(e.stderr)));
     writeFileSync(join(dir, 'edited.json'), JSON.stringify({ ...att.item, reason: undefined, issuedAt: '2020-01-01T00:00:00Z' }));
     assert.throws(() => run(join(dir, 'edited.json')), (e) => e.status === 1 && /the proof is for a different item/.test(String(e.stderr)));
   } finally {
