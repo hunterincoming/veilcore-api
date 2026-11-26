@@ -1,0 +1,81 @@
+{
+  "items": [
+    {
+      "kind": "batch-root",
+      "item": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bytesHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "entry": "1a0c0bbec2cc50083493552a0edc73259544e824bbff9f480904ef4a6ae68d90"
+    },
+    {
+      "kind": "batch-root",
+      "item": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "bytesHex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "entry": "5edc61adb53234faa3f74bd6ea86dd7b21947bf6af8523ec91e37068daf9a7de"
+    },
+    {
+      "kind": "attestation",
+      "item": {
+        "attestationId": "att-fixture-1",
+        "type": "genetic-fingerprint",
+        "subjectCommitment": "1111111111111111111111111111111111111111111111111111111111111111",
+        "documentHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "hashAlgorithm": "sha256",
+        "issuedAt": "2026-11-01T12:00:00Z",
+        "signature": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        "signatureAlgorithm": "ed25519",
+        "attester": {
+          "publicKey": "3333333333333333333333333333333333333333333333333333333333333333",
+          "displayName": "Fixture Lab",
+          "role": "laboratory"
+        }
+      },
+      "bytesText": "{\"attestationId\":\"att-fixture-1\",\"attester\":{\"displayName\":\"Fixture Lab\",\"publicKey\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"role\":\"laboratory\"},\"documentHash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"hashAlgorithm\":\"sha256\",\"issuedAt\":\"2026-11-01T12:00:00Z\",\"signature\":\"abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab\",\"signatureAlgorithm\":\"ed25519\",\"subjectCommitment\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"type\":\"genetic-fingerprint\"}",
+      "entry": "05a5f2f8cdabe0a9d5208d0c11a9c8953e6d72c9b212a7e0d07482a92ff3a0dc"
+    },
+    {
+      "kind": "withdrawal",
+      "item": {
+        "attestationId": "att-fixture-1",
+        "attesterPublicKey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "reason": "superseded",
+        "retractedAt": "2026-11-02T12:00:00Z",
+        "signature": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      },
+      "bytesText": "{\"attestationId\":\"att-fixture-1\",\"attesterPublicKey\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"reason\":\"superseded\",\"retractedAt\":\"2026-11-02T12:00:00Z\",\"signature\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"}",
+      "entry": "0c42e7cd2ecb58346543df25894619f44acef1680f3d87f237a1748c3cfdad92"
+    },
+    {
+      "kind": "enrolment",
+      "item": {
+        "publicKey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "displayName": "Fixture Lab",
+        "role": "laboratory",
+        "registeredAt": 1793534400000
+      },
+      "bytesText": "{\"displayName\":\"Fixture Lab\",\"issuedAt\":1793534400000,\"publicKey\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"role\":\"laboratory\",\"type\":\"veilcore/attester-registration/v1\"}",
+      "entry": "35a1977a2fba6775891612a9347163611402f6da70dce71ff79bb512f22f3030"
+    },
+    {
+      "kind": "rfc3161",
+      "item": "3082eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "bytesHex": "3082eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "entry": "92127591b21f57926a49b5e8d9388e3338bc5e974355c75840ad84479e2f49a4"
+    },
+    {
+      "kind": "rfc3161",
+      "item": "30825a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "bytesHex": "30825a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "entry": "694a8f830dc99297171e978b45b33f17c7e9efa1c8f3640c3c9919627d083bbd"
+    }
+  ],
+  "entries": [
+    "05a5f2f8cdabe0a9d5208d0c11a9c8953e6d72c9b212a7e0d07482a92ff3a0dc",
+    "0c42e7cd2ecb58346543df25894619f44acef1680f3d87f237a1748c3cfdad92",
+    "1a0c0bbec2cc50083493552a0edc73259544e824bbff9f480904ef4a6ae68d90",
+    "35a1977a2fba6775891612a9347163611402f6da70dce71ff79bb512f22f3030",
+    "5edc61adb53234faa3f74bd6ea86dd7b21947bf6af8523ec91e37068daf9a7de",
+    "694a8f830dc99297171e978b45b33f17c7e9efa1c8f3640c3c9919627d083bbd",
+    "92127591b21f57926a49b5e8d9388e3338bc5e974355c75840ad84479e2f49a4"
+  ],
+  "root": "a5c76bc5f78c14633d5a43dc0dfb4b68c45b71f39a1770466541a6dd9971db0d"
+}

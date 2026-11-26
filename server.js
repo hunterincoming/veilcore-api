@@ -197,6 +197,10 @@ let passkeyVault = null; // lineage/passkey-vault.mjs, set once loaded
 let accountCopies = null; // lineage/account-copy.mjs, set once loaded
 let labResults = null; // lineage/lab-results.mjs, set once loaded
 let embed = null;
+// The evidence re-stamp (lineage/restamp.mjs), set once loaded, and only when VEILCORE_RESTAMP
+// is manual or on, or re-stamps were made before (they stay served when it is turned off).
+let restamps = null;
+let restampMode = 'off';
 // The commitment checker (lineage/conformance.mjs). Until sealed records (16 Oct 2026) it
 // recomputed every record's fingerprint before storing it. A sealed record's contents are
 // unreadable here, so it is no longer on the write path: the holder's browser recomputes
@@ -294,6 +298,21 @@ import('./lineage/routes.mjs')
     } catch (e) {
       console.error('lab results unavailable:', e.message);
     }
+    // Last, and on its own: a problem here never stops the rest of the registry.
+    try {
+      const { createRestamps, restampSettings } = await import('./lineage/restamp.mjs');
+      const rs = restampSettings(process.env);
+      if (rs.problems.length) console.error(`re-stamps off: ${rs.problems.join('; ')}`);
+      const madeBefore = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'restamps'").get();
+      if (rs.mode !== 'off' || madeBefore) {
+        restamps = createRestamps(db);
+        restampMode = rs.mode;
+        if (rs.mode !== 'off') startRestampTimer(rs);
+        console.log(`re-stamps ${rs.mode}${rs.mode === 'on' ? ` (every ${Math.round(rs.everyMs / 86_400_000)} days)` : ''}`);
+      }
+    } catch (e) {
+      console.error('re-stamps unavailable:', e.message);
+    }
     console.log('lineage layer ready, root', lineage.root().slice(0, 16));
     console.log('transfers ready');
     console.log('batch anchoring ready');
@@ -361,6 +380,33 @@ function startOtsTimer() {
     running = true;
     try { await batches.otsMaintenance(); } catch { /* recorded per batch */ } finally { running = false; }
   }, every).unref();
+}
+
+/**
+ * The evidence re-stamp's timer (lineage/restamp.mjs). Hourly: with VEILCORE_RESTAMP=on, make a
+ * re-stamp when the newest is VEILCORE_RESTAMP_EVERY_DAYS old (or there is none); in both on and
+ * manual, retry a stamp that failed and upgrade pending ones to Bitcoin.
+ */
+function startRestampTimer(rs) {
+  let busy = false;
+  const tick = async () => {
+    if (busy || !restamps) return;
+    busy = true;
+    try {
+      if (rs.mode === 'on' && restamps.due(rs.everyMs)) {
+        const out = await restamps.run();
+        if (out.error) console.error(`re-stamp: ${out.error}`);
+        else console.log(`re-stamp ${out.restampId}: ${out.entries} entries, root ${out.root}${out.stampError ? `; stamp failed (${out.stampError}), retried hourly` : ''}`);
+      }
+      await restamps.upkeep();
+    } catch (e) {
+      console.error('re-stamp upkeep failed:', e.message);
+    } finally {
+      busy = false;
+    }
+  };
+  setTimeout(tick, 5 * 60_000).unref();
+  setInterval(tick, 3_600_000).unref();
 }
 
 /**
@@ -3643,6 +3689,68 @@ app.get('/batches/:id/root.tst', (req, res) => {
   if (b === undefined) return res.status(404).json({ error: 'no such batch' });
   if (!b.token) return res.status(404).json({ error: 'this batch has no RFC 3161 timestamp yet' });
   res.type('application/octet-stream').set('Content-Disposition', 'attachment; filename="root.tst"').send(b.token);
+});
+
+// ---- the evidence re-stamp (lineage/restamp.mjs; the site's docs/restamp.md) ----
+//
+// Off by default (VEILCORE_RESTAMP unset): every route below answers 404 and says so. What is
+// published is hashes only: the root, its .ots, the sorted entries and how many of each kind.
+
+const RESTAMP_ID = /^RS-[0-9]{8}-[0-9A-F]{4}$/;
+const RESTAMPS_OFF = 're-stamps are off on this registry (VEILCORE_RESTAMP)';
+const requireRestamps = (req, res) => {
+  if (!restamps) { res.status(404).json({ error: RESTAMPS_OFF }); return false; }
+  if (req.params.id !== undefined && !RESTAMP_ID.test(req.params.id)) { res.status(404).json({ error: 'no such re-stamp' }); return false; }
+  return true;
+};
+
+/** Make a re-stamp now (operator). Only with VEILCORE_RESTAMP=manual or on. */
+app.post('/restamps', async (req, res) => {
+  if (!requireOperator(req, res)) return;
+  if (!restamps || restampMode === 'off') return res.status(404).json({ error: RESTAMPS_OFF });
+  const out = await restamps.run();
+  if (out.error) return res.status(out.code ?? 500).json(out);
+  res.json(out);
+});
+
+/** Every re-stamp, newest first. Public. */
+app.get('/restamps', (req, res) => {
+  if (!requireRestamps(req, res)) return;
+  res.json({ restamps: restamps.list() });
+});
+
+/** The published list of one re-stamp: rebuild its root from this alone. Public. */
+app.get('/restamps/:id/manifest.json', (req, res) => {
+  if (!requireRestamps(req, res)) return;
+  const m = restamps.manifest(req.params.id);
+  if (!m) return res.status(404).json({ error: 'no such re-stamp' });
+  res.set('Content-Disposition', 'attachment; filename="manifest.json"').json(m);
+});
+
+/** The re-stamp root as the 32 raw bytes OpenTimestamps stamped. Public. */
+app.get('/restamps/:id/root.bin', (req, res) => {
+  if (!requireRestamps(req, res)) return;
+  const r = restamps.otsFor(req.params.id);
+  if (!r) return res.status(404).json({ error: 'no such re-stamp' });
+  res.type('application/octet-stream').set('Content-Disposition', 'attachment; filename="root.bin"').send(Buffer.from(r.root, 'hex'));
+});
+
+/** The OpenTimestamps proof of a re-stamp root. Public. `ots verify root.bin.ots` beside root.bin. */
+app.get('/restamps/:id/root.bin.ots', (req, res) => {
+  if (!requireRestamps(req, res)) return;
+  const r = restamps.otsFor(req.params.id);
+  if (!r) return res.status(404).json({ error: 'no such re-stamp' });
+  if (!r.ots) return res.status(404).json({ error: 'this re-stamp has no OpenTimestamps proof yet', status: r.status });
+  res.type('application/vnd.opentimestamps.v1').set('Content-Disposition', 'attachment; filename="root.bin.ots"')
+    .set('X-OpenTimestamps-Status', r.status).send(r.ots);
+});
+
+/** The SPEC 5 inclusion proof of one entry in a re-stamp. Public. */
+app.get('/restamps/:id/proof/:entry', async (req, res) => {
+  if (!requireRestamps(req, res)) return;
+  const out = await restamps.proofFor(req.params.id, req.params.entry);
+  if (out.error) return res.status(out.code).json({ error: out.error });
+  res.json(out.proof);
 });
 
 /**
